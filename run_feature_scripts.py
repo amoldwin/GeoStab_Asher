@@ -3,7 +3,7 @@ import subprocess
 
 # Location of the scripts and parent data directory
 FEATURE_SCRIPT_DIR = "generate_features"
-DATA_PARENT_DIR = "data"  # Change to your actual parent directory, e.g. "data" or "samples"
+DATA_PARENT_DIR = "./data/dTm/S4346/"  # Change to your actual parent directory, e.g. "data" or "samples"
 
 def run_feature_scripts(sample_dir):
     for variant in ["wt_data", "mut_data"]:
@@ -62,11 +62,15 @@ def main():
     for sample in os.listdir(DATA_PARENT_DIR):
         sample_dir = os.path.join(DATA_PARENT_DIR, sample)
         if not os.path.isdir(sample_dir):
+            print(f"could not find {sample_dir}", flush=True)
             continue
         if not os.path.exists(os.path.join(sample_dir, "mut_info.csv")):
+
+            print(f"could not find mut_info in {sample_dir}", flush=True)
+
             continue
 
-        print(f"Processing {sample_dir}...")
+        print(f"Processing {sample_dir}...", flush=True)
         run_feature_scripts(sample_dir)
 
         # Final ensemble generation

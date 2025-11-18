@@ -11,13 +11,16 @@ def main(model_index, fasta_file, saved_folder):
     seq = str(list(SeqIO.parse(fasta_file, "fasta"))[0].seq)
     with torch.no_grad():
         model, alphabet = torch.hub.load("facebookresearch/esm:main", f"esm1v_t33_650M_UR90S_{model_index}")
-        model = model.eval().to("cpu")
+        
+        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.eval().to(device)
 
         batch_converter = alphabet.get_batch_converter()
         data = [("protein", seq)]
         batch_labels, batch_strs, batch_tokens = batch_converter(data)
 
-        token_probs = torch.log_softmax(model(batch_tokens)["logits"], dim=-1)
+        token_probs = torch.log_softmax(model(batch_tokens.to(device))["logits"], dim=-1)
         logits_33 = token_probs[0, 1:-1, :].detach().cpu().clone()
 
         # logits 33 dim -> 20 dim
