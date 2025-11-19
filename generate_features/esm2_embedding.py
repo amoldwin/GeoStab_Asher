@@ -13,7 +13,7 @@ def run_esm2_embedding(fasta_files, saved_folders):
         record = list(SeqIO.parse(fpath, "fasta"))[0]
         batch_labels.append(record.id)
         batch_strs.append(str(record.seq))
-
+    
     with torch.no_grad():
         model, alphabet = torch.hub.load("facebookresearch/esm:main", "esm2_t33_650M_UR50D")
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -24,9 +24,18 @@ def run_esm2_embedding(fasta_files, saved_folders):
         result = model(batch_tokens, repr_layers=[33], return_contacts=False)
         representations = result["representations"][33][:, 1:-1, :]  # shape: (batch, seq_len, 1280)
 
-    # Write output files
+    # Write output files, with explicit check
     for i, out_folder in enumerate(saved_folders):
         os.makedirs(out_folder, exist_ok=True)
+        fasta_len = len(batch_strs[i])
+        emb_len = representations[i].shape[0]
+        if fasta_len != emb_len:
+            raise RuntimeError(
+                f"ESM2 embedding length mismatch for {out_folder}:\n"
+                f"FASTA length: {fasta_len}\n"
+                f"ESM2 embedding length: {emb_len}\n"
+                f"Input sequence: {batch_strs[i]}\n"
+            )
         torch.save(representations[i].detach().cpu().clone(), f"{out_folder}/esm2.pt")
 
 @click.command()
