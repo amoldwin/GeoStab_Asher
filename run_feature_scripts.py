@@ -1,6 +1,7 @@
 import os
-import subprocess
 from glob import glob
+from generate_features.esm2_embedding import run_esm2_embedding
+from generate_features.esm1v_logits import run_esm1v_logits
 
 FEATURE_SCRIPT_DIR = "generate_features"
 DATA_PARENT_DIR = "./data/dTm/S4346/"  # Change if needed
@@ -17,7 +18,7 @@ def collect_variant_fastas(samples, variant):
             parent_dirs.append(vdir)
     return fasta_files, parent_dirs
 
-def batch_run_esm2(fasta_files, parent_dirs, batch_size=64):
+def batch_run_esm2(fasta_files, parent_dirs, batch_size=8):
     missing = []
     for fastapath, vdir in zip(fasta_files, parent_dirs):
         outpath = os.path.join(vdir, "esm2.pt")
@@ -29,63 +30,54 @@ def batch_run_esm2(fasta_files, parent_dirs, batch_size=64):
         batch = missing[i:i+batch_size]
         input_files = [f for f, _ in batch]
         out_dirs = [d for _, d in batch]
-        cmd = [
-            "python", os.path.join(FEATURE_SCRIPT_DIR, "esm2_embedding.py"),
-            "--fasta_files", *input_files,
-            "--saved_folders", *out_dirs
-        ]
-        subprocess.run(cmd)
+        print(f"Running ESM2 batch: {input_files}")
+        run_esm2_embedding(input_files, out_dirs)
 
-def batch_run_esm1v(fasta_files, parent_dirs, batch_size=64):
+def batch_run_esm1v(fasta_files, parent_dirs, batch_size=8):
     missing = []
     for idx in range(1, 6):
         for fastapath, vdir in zip(fasta_files, parent_dirs):
             outpath = os.path.join(vdir, f"esm1v-{idx}.pt")
             if not os.path.exists(outpath):
-                missing.append((fastapath, vdir, idx))
-    # Split into manageable batches
+                missing.append((fastapath, vdir, str(idx)))  # model_indices are strings
+
     for i in range(0, len(missing), batch_size):
         batch = missing[i:i+batch_size]
         input_files = [f for f, _, _ in batch]
         out_dirs = [d for _, d, _ in batch]
-        model_idxs = [str(idx) for _, _, idx in batch]
-        subprocess.run([
-            "python", os.path.join(FEATURE_SCRIPT_DIR, "esm1v_logits.py"),
-            "--fasta_files", *input_files,
-            "--saved_folders", *out_dirs,
-            "--model_indices", *model_idxs
-        ])
+        model_idxs = [idx for _, _, idx in batch]
+        print(f"Running ESM1v batch: {input_files} model_idxs: {model_idxs}")
+        run_esm1v_logits(model_idxs, input_files, out_dirs)
 
 def run_fixed_embedding(fasta_files, parent_dirs):
+    import generate_features.fixed_embedding as fe
     for fastapath, vdir in zip(fasta_files, parent_dirs):
         outpath = os.path.join(vdir, "fixed_embedding.pt")
         if not os.path.exists(outpath):
-            subprocess.run([
-                "python", os.path.join(FEATURE_SCRIPT_DIR, "fixed_embedding.py"),
-                "--fasta_file", fastapath,
-                "--saved_folder", vdir
-            ])
+            fe.main.callback(fasta_file=fastapath, saved_folder=vdir)
 
 def run_coordinate_and_pair(sample_dirs):
+    import generate_features.coordinate as coord
+    import generate_features.pair as pair
     for sample_dir in sample_dirs:
         for variant in ["wt_data", "mut_data"]:
             vdir = os.path.join(sample_dir, variant)
             pdb = "wt.pdb" if variant == "wt_data" else "mut.pdb"
             pdbpath = os.path.join(vdir, pdb)
+            coord_path = os.path.join(vdir, "coordinate.pt")
+            pair_path = os.path.join(vdir, "pair.pt")
             if os.path.exists(pdbpath):
-                coord_path = os.path.join(vdir, "coordinate.pt")
                 if not os.path.exists(coord_path):
-                    subprocess.run([
-                        "python", os.path.join(FEATURE_SCRIPT_DIR, "coordinate.py"),
-                        "--pdb_file", pdbpath,
-                        "--saved_folder", vdir
-                    ])
-                if os.path.exists(coord_path) and not os.path.exists(os.path.join(vdir, "pair.pt")):
-                    subprocess.run([
-                        "python", os.path.join(FEATURE_SCRIPT_DIR, "pair.py"),
-                        "--coordinate_file", coord_path,
-                        "--saved_folder", vdir
-                    ])
+                    coord.main.callback(pdb_file=pdbpath, saved_folder=vdir)
+                if os.path.exists(coord_path) and not os.path.exists(pair_path):
+                    pair.main.callback(coordinate_file=coord_path, saved_folder=vdir)
+
+def run_ensemble(sample_dirs):
+    import generate_features.ensemble_ddGdTm as ensemble
+    for sample_dir in sample_dirs:
+        ensemble_path = os.path.join(sample_dir, "ensemble.pt")
+        if not os.path.exists(ensemble_path):
+            ensemble.main.callback(saved_folder=sample_dir)
 
 def main():
     # Step 1: Identify sample folders
@@ -102,24 +94,18 @@ def main():
     wt_fastas, wt_dirs = collect_variant_fastas(sample_dirs, "wt_data")
     mut_fastas, mut_dirs = collect_variant_fastas(sample_dirs, "mut_data")
 
-    # Step 3: Batch DL models (must update called scripts for batching!)
+    # Step 3: Batch DL models
     print("Batching ESM2...", flush=True)
-    batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=64)
+    batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
     print("Batching ESM1v...", flush=True)
-    batch_run_esm1v(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=64)
+    batch_run_esm1v(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
 
     # Step 4: Lightweight features (fixed_embedding, coordinate, pair)
     run_fixed_embedding(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
     run_coordinate_and_pair(sample_dirs)
 
     # Step 5: Ensemble generation
-    for sample_dir in sample_dirs:
-        ensemble_path = os.path.join(sample_dir, "ensemble.pt")
-        if not os.path.exists(ensemble_path):
-            subprocess.run([
-                "python", os.path.join(FEATURE_SCRIPT_DIR, "ensemble_ddGdTm.py"),
-                "--saved_folder", sample_dir,
-            ])
+    run_ensemble(sample_dirs)
 
 if __name__ == "__main__":
     main()

@@ -3,11 +3,7 @@ import torch
 from Bio import SeqIO
 import os
 
-@click.command()
-@click.option("--model_indices", multiple=True, required=True, type=str, help="ESM1v model indices (e.g. 1 2 3 4 5). Each sample should have an index")
-@click.option("--fasta_files", multiple=True, required=True, type=str, help="FASTA files to process (same order as saved_folders/model_indices)")
-@click.option("--saved_folders", multiple=True, required=True, type=str, help="Output folders (must match order of fasta_files)")
-def main(model_indices, fasta_files, saved_folders):
+def run_esm1v_logits(model_indices, fasta_files, saved_folders):
     if len(fasta_files) != len(saved_folders) or len(fasta_files) != len(model_indices):
         raise ValueError("Number of fasta_files, saved_folders, and model_indices must all match")
 
@@ -57,6 +53,13 @@ def main(model_indices, fasta_files, saved_folders):
             for i, out_folder in enumerate(output_dirs):
                 os.makedirs(out_folder, exist_ok=True)
                 torch.save(logits_20[i].detach().cpu().clone(), f"{out_folder}/esm1v-{model_index}.pt")
+
+@click.command()
+@click.option("--model_indices", multiple=True, required=True, type=str, help="ESM1v model indices (e.g. 1 2 3 4 5). Each sample should have an index")
+@click.option("--fasta_files", multiple=True, required=True, type=str, help="FASTA files to process (same order as saved_folders/model_indices)")
+@click.option("--saved_folders", multiple=True, required=True, type=str, help="Output folders (must match order of fasta_files)")
+def main(model_indices, fasta_files, saved_folders):
+    run_esm1v_logits(model_indices, fasta_files, saved_folders)
 
 if __name__ == "__main__":
     main()
