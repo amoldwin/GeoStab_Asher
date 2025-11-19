@@ -29,11 +29,12 @@ def batch_run_esm2(fasta_files, parent_dirs, batch_size=64):
         batch = missing[i:i+batch_size]
         input_files = [f for f, _ in batch]
         out_dirs = [d for _, d in batch]
-        subprocess.run([
+        cmd = [
             "python", os.path.join(FEATURE_SCRIPT_DIR, "esm2_embedding.py"),
             "--fasta_files", *input_files,
             "--saved_folders", *out_dirs
-        ])
+        ]
+        subprocess.run(cmd)
 
 def batch_run_esm1v(fasta_files, parent_dirs, batch_size=64):
     missing = []
