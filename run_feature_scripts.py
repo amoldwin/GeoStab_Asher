@@ -99,8 +99,8 @@ def main():
     mut_fastas, mut_dirs = collect_variant_fastas(sample_dirs, "mut_data")
 
     # Step 3: Batch DL models
-    # print("Batching ESM2...", flush=True)
-    # batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
+    print("Batching ESM2...", flush=True)
+    batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
     
     
     #removing because esm1v not 
