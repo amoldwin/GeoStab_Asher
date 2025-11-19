@@ -30,7 +30,7 @@ def batch_run_esm2(fasta_files, parent_dirs, batch_size=8):
         batch = missing[i:i+batch_size]
         input_files = [f for f, _ in batch]
         out_dirs = [d for _, d in batch]
-        print(f"Running ESM2 batch: {input_files}")
+        print(f"Running ESM2 batch: {input_files}", flush=True)
         run_esm2_embedding(input_files, out_dirs)
 
 def batch_run_esm1v(fasta_files, parent_dirs, batch_size=8):
@@ -46,7 +46,7 @@ def batch_run_esm1v(fasta_files, parent_dirs, batch_size=8):
         input_files = [f for f, _, _ in batch]
         out_dirs = [d for _, d, _ in batch]
         model_idxs = [idx for _, _, idx in batch]
-        print(f"Running ESM1v batch: {input_files} model_idxs: {model_idxs}")
+        print(f"Running ESM1v batch: {input_files} model_idxs: {model_idxs}", flush=True)
         run_esm1v_logits(model_idxs, input_files, out_dirs)
 
 def run_fixed_embedding(fasta_files, parent_dirs):
