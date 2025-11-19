@@ -66,14 +66,14 @@ def run_coordinate_and_pair(sample_dirs):
         for variant in ["wt_data", "mut_data"]:
             print(f"running coordinate and pair for: {variant} ", flush=True)
             vdir = os.path.join(sample_dir, variant)
-            pdb = "wt.pdb" if variant == "wt_data" else "mut.pdb"
+            pdb = "wt_esmfold.pdb" if variant == "wt_data" else "mut.pdb"
             pdbpath = os.path.join(vdir, pdb)
             coord_path = os.path.join(vdir, "coordinate.pt")
             pair_path = os.path.join(vdir, "pair.pt")
             if os.path.exists(pdbpath):
-                if not os.path.exists(coord_path):
+                if True:# not os.path.exists(coord_path):
                     coord.main.callback(pdb_file=pdbpath, saved_folder=vdir)
-                if os.path.exists(coord_path) and not os.path.exists(pair_path):
+                if True:# os.path.exists(coord_path) and not os.path.exists(pair_path):
                     pair.main.callback(coordinate_file=coord_path, saved_folder=vdir)
 
 def run_ensemble(sample_dirs):
@@ -108,11 +108,11 @@ def main():
     # batch_run_esm1v(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
 
     # Step 4: Lightweight features (fixed_embedding, coordinate, pair)
-    run_fixed_embedding(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
+    #run_fixed_embedding(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
     run_coordinate_and_pair(sample_dirs)
 
     # Step 5: Ensemble generation
-    run_ensemble(sample_dirs)
+    #run_ensemble(sample_dirs)
 
 if __name__ == "__main__":
     main()

@@ -58,8 +58,8 @@ class GeoDTmDataset(Dataset):
         # mut_info.csv (optional)
         info_path = os.path.join(os.path.dirname(folder), "mut_info.csv")
         # Not strictly needed for feature construction here, but can be loaded if desired
-        if os.path.exists(info_path):
-            feature_dict["mut_info"] = pd.read_csv(info_path, index_col=0)
+        # if os.path.exists(info_path):
+            # feature_dict["mut_info"] = pd.read_csv(info_path, index_col=0)
         return feature_dict
 
     def __len__(self):
@@ -226,7 +226,7 @@ def main():
     parser.add_argument("--pair_dim", type=int, default=32)
     parser.add_argument("--n_head", type=int, default=8)
     parser.add_argument("--num_layer", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--epochs_frozen", type=int, default=5,
                         help="Number of epochs with encoder frozen (pretraining stage)")
