@@ -36,7 +36,7 @@ class GeoDTmDataset(Dataset):
 
         # adapt these if your column names differ
         assert "name" in self.df.columns, "CSV must contain a 'name' column."
-        assert "dtm" in self.df.columns, "CSV must contain a 'dtm' column with ΔTm values."
+        assert "dTm" in self.df.columns, "CSV must contain a 'dTm' column with ΔTm values."
 
     def _load_feature_dict(self, sample_id: str, variant: str):
         folder = os.path.join(self.features_dir, sample_id, variant)
@@ -68,7 +68,7 @@ class GeoDTmDataset(Dataset):
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         sample_id = str(row["name"])
-        target = float(row["dtm"])
+        target = float(row["dTm"])
 
         wt_data = self._load_feature_dict(sample_id, "wt_data")
         mut_data = self._load_feature_dict(sample_id, "mut_data")
