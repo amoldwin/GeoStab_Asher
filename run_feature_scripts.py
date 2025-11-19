@@ -17,36 +17,37 @@ def collect_variant_fastas(samples, variant):
             parent_dirs.append(vdir)
     return fasta_files, parent_dirs
 
-def batch_run_esm2(fasta_files, parent_dirs):
-    # (Assumes generate_features/esm2_embedding.py supports batching: as --fasta_files foo1.fa foo2.fa ...)
+def batch_run_esm2(fasta_files, parent_dirs, batch_size=64):
     missing = []
     for fastapath, vdir in zip(fasta_files, parent_dirs):
         outpath = os.path.join(vdir, "esm2.pt")
         if not os.path.exists(outpath):
             missing.append((fastapath, vdir))
 
-    if missing:
-        # Build file lists
-        input_files = [f for f, _ in missing]
-        out_dirs = [d for _, d in missing]
+    # Split into manageable batches
+    for i in range(0, len(missing), batch_size):
+        batch = missing[i:i+batch_size]
+        input_files = [f for f, _ in batch]
+        out_dirs = [d for _, d in batch]
         subprocess.run([
             "python", os.path.join(FEATURE_SCRIPT_DIR, "esm2_embedding.py"),
             "--fasta_files", *input_files,
             "--saved_folders", *out_dirs
         ])
 
-def batch_run_esm1v(fasta_files, parent_dirs):
+def batch_run_esm1v(fasta_files, parent_dirs, batch_size=64):
     missing = []
     for idx in range(1, 6):
         for fastapath, vdir in zip(fasta_files, parent_dirs):
             outpath = os.path.join(vdir, f"esm1v-{idx}.pt")
             if not os.path.exists(outpath):
                 missing.append((fastapath, vdir, idx))
-    if missing:
-        # Assumes batching interface
-        input_files = [f for f, _, _ in missing]
-        out_dirs = [d for _, d, _ in missing]
-        model_idxs = [str(i) for _, _, i in missing]
+    # Split into manageable batches
+    for i in range(0, len(missing), batch_size):
+        batch = missing[i:i+batch_size]
+        input_files = [f for f, _, _ in batch]
+        out_dirs = [d for _, d, _ in batch]
+        model_idxs = [str(idx) for _, _, idx in batch]
         subprocess.run([
             "python", os.path.join(FEATURE_SCRIPT_DIR, "esm1v_logits.py"),
             "--fasta_files", *input_files,
@@ -102,9 +103,9 @@ def main():
 
     # Step 3: Batch DL models (must update called scripts for batching!)
     print("Batching ESM2...", flush=True)
-    batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
+    batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=64)
     print("Batching ESM1v...", flush=True)
-    batch_run_esm1v(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
+    batch_run_esm1v(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=64)
 
     # Step 4: Lightweight features (fixed_embedding, coordinate, pair)
     run_fixed_embedding(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
