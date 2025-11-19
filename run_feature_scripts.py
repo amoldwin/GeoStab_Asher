@@ -50,8 +50,11 @@ def batch_run_esm1v(fasta_files, parent_dirs, batch_size=8):
         run_esm1v_logits(model_idxs, input_files, out_dirs)
 
 def run_fixed_embedding(fasta_files, parent_dirs):
+    
     import generate_features.fixed_embedding as fe
     for fastapath, vdir in zip(fasta_files, parent_dirs):
+        print(f"Running fixed embedding for: {fastapath} ", flush=True)
+
         outpath = os.path.join(vdir, "fixed_embedding.pt")
         if not os.path.exists(outpath):
             fe.main.callback(fasta_file=fastapath, saved_folder=vdir)
@@ -61,6 +64,7 @@ def run_coordinate_and_pair(sample_dirs):
     import generate_features.pair as pair
     for sample_dir in sample_dirs:
         for variant in ["wt_data", "mut_data"]:
+            print(f"running coordinate and pair for: {variant} ", flush=True)
             vdir = os.path.join(sample_dir, variant)
             pdb = "wt.pdb" if variant == "wt_data" else "mut.pdb"
             pdbpath = os.path.join(vdir, pdb)
@@ -95,8 +99,8 @@ def main():
     mut_fastas, mut_dirs = collect_variant_fastas(sample_dirs, "mut_data")
 
     # Step 3: Batch DL models
-    print("Batching ESM2...", flush=True)
-    batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
+    # print("Batching ESM2...", flush=True)
+    # batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
     
     
     #removing because esm1v not 
