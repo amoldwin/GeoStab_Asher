@@ -8,6 +8,8 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../model_dTm_3D")))
+
 from model import PretrainEncoder, ATOM_CA
 
 ###############################################################################
