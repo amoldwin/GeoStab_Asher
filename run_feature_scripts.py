@@ -97,8 +97,11 @@ def main():
     # Step 3: Batch DL models
     print("Batching ESM2...", flush=True)
     batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
-    print("Batching ESM1v...", flush=True)
-    batch_run_esm1v(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
+    
+    
+    #removing because esm1v not 
+    # print("Batching ESM1v...", flush=True)
+    # batch_run_esm1v(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
 
     # Step 4: Lightweight features (fixed_embedding, coordinate, pair)
     run_fixed_embedding(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
