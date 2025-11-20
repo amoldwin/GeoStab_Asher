@@ -45,12 +45,14 @@ class GeoDTmDataset(Dataset):
         with open(pkl_path, "rb") as f:
             pkl = pickle.load(f)
             plddt_raw = torch.tensor(pkl["plddt"], dtype=torch.float32)
-            # ---- PATCH: Remove batch dim if present ----
+            # Remove batch dim if present
             if plddt_raw.ndim == 2 and plddt_raw.shape[0] == 1:
                 plddt_raw = plddt_raw[0]
+
+        L_fixed = fixed.shape[0]
         L_plddt = plddt_raw.shape[0]
 
-        # --- Fix pLDDT length to match fixed_embedding length ---
+        # Fix length mismatch if needed
         if L_plddt != L_fixed:
             if L_plddt > L_fixed:
                 print(f"[GeoDTmDataset] Cropping pLDDT from {L_plddt} to {L_fixed} for {folder}", flush=True)
@@ -59,11 +61,7 @@ class GeoDTmDataset(Dataset):
                 print(f"[GeoDTmDataset] WARNING: pLDDT shorter ({L_plddt}) than fixed_embedding ({L_fixed}) for {folder}. Padding.", flush=True)
                 pad = plddt_raw[-1].repeat(L_fixed - L_plddt)
                 plddt_raw = torch.cat([plddt_raw, pad], dim=0)
-
-        # Normalize to [0, 1]
         plddt = plddt_raw / 100.0
-
-        # ---- PATCH: Now shapes are [L, 7] and [L, 1], safe to concatenate
         out["fixed_embedding"] = torch.cat([fixed, plddt.unsqueeze(-1)], dim=-1)
         # Load pair features
         out["pair"] = torch.load(os.path.join(folder, "pair.pt")).float()
