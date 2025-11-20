@@ -32,7 +32,6 @@ class GeoDTmDataset(Dataset):
 
     def _load_feature_dict(self, sample_id: str, variant: str):
         folder = os.path.join(self.features_dir, sample_id, variant)
-
         out = {}
         # Load ESM2 embedding
         out["dynamic_embedding"] = torch.load(os.path.join(folder, "esm2.pt")).float()
@@ -46,36 +45,26 @@ class GeoDTmDataset(Dataset):
         with open(pkl_path, "rb") as f:
             pkl = pickle.load(f)
             plddt_raw = torch.tensor(pkl["plddt"], dtype=torch.float32)
-
+            # ---- PATCH: Remove batch dim if present ----
+            if plddt_raw.ndim == 2 and plddt_raw.shape[0] == 1:
+                plddt_raw = plddt_raw[0]
         L_plddt = plddt_raw.shape[0]
 
         # --- Fix pLDDT length to match fixed_embedding length ---
         if L_plddt != L_fixed:
             if L_plddt > L_fixed:
-                # Most common case: batched ESMFold padded up to max length in batch
-                print(
-                    f"[GeoDTmDataset] Cropping pLDDT from {L_plddt} to {L_fixed} "
-                    f"for {folder}",
-                    flush=True,
-                )
+                print(f"[GeoDTmDataset] Cropping pLDDT from {L_plddt} to {L_fixed} for {folder}", flush=True)
                 plddt_raw = plddt_raw[:L_fixed]
             else:
-                # Unusual: pLDDT shorter than fixed_embedding
-                # Pad with last value (or zeros, if you prefer) and warn
-                print(
-                    f"[GeoDTmDataset] WARNING: pLDDT shorter ({L_plddt}) than "
-                    f"fixed_embedding ({L_fixed}) for {folder}. Padding.",
-                    flush=True,
-                )
+                print(f"[GeoDTmDataset] WARNING: pLDDT shorter ({L_plddt}) than fixed_embedding ({L_fixed}) for {folder}. Padding.", flush=True)
                 pad = plddt_raw[-1].repeat(L_fixed - L_plddt)
                 plddt_raw = torch.cat([plddt_raw, pad], dim=0)
 
         # Normalize to [0, 1]
         plddt = plddt_raw / 100.0
 
-        # Concatenate pLDDT as additional column
+        # ---- PATCH: Now shapes are [L, 7] and [L, 1], safe to concatenate
         out["fixed_embedding"] = torch.cat([fixed, plddt.unsqueeze(-1)], dim=-1)
-
         # Load pair features
         out["pair"] = torch.load(os.path.join(folder, "pair.pt")).float()
         # Load atom mask (from coordinate.pt)
