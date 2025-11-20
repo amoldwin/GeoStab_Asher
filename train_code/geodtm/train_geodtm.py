@@ -1,36 +1,81 @@
 import os
 import math
 import argparse
-from typing import Dict, Tuple
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import pandas as pd
-
-# Import the geometric encoder from your existing model.py
-from model import PretrainEncoder, ATOM_CA  # ATOM_CA defined in your model.py
+import numpy as np
+import pickle
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../model_dTm_3D")))
+# Import the geometric encoder from your model.py
+from model import PretrainEncoder, ATOM_CA
 
 ###############################################################################
-# GeoDTm model: shared encoder for WT / Mutant + anti-symmetric ΔTm head
+# GeoDTm dataset with ESMFold pLDDT from pickles
+###############################################################################
+
+class GeoDTmDataset(Dataset):
+    """
+    Loads WT/Mut features (esm2.pt, fixed_embedding.pt, pair.pt, coordinate.pt)
+    and ESMFold plddt scores from pickle (*.pkl).
+    Places plddt vector as last column into fixed_embedding (or concatenates).
+    """
+    def __init__(self, csv_or_df, features_dir: str):
+        super().__init__()
+        self.df = pd.read_csv(csv_or_df) if isinstance(csv_or_df, str) else csv_or_df.reset_index(drop=True)
+        self.features_dir = features_dir
+        assert "name" in self.df.columns, "CSV must contain a 'name' column."
+        assert "dTm" in self.df.columns, "CSV must contain a 'dTm' column."
+
+    def _load_feature_dict(self, sample_id: str, variant: str):
+        folder = os.path.join(self.features_dir, sample_id, variant)
+
+        out = {}
+        # Load ESM2 embedding
+        out["dynamic_embedding"] = torch.load(os.path.join(folder, "esm2.pt")).float()
+        # Load physicochemical fixed embedding
+        fixed = torch.load(os.path.join(folder, "fixed_embedding.pt")).float()
+        # Load pLDDT from ESMFold pickle
+        pkl_filename = "wt_esmf.pkl" if variant == "wt_data" else "mut_esmf.pkl"
+        pkl_path = os.path.join(folder, pkl_filename)
+        with open(pkl_path, "rb") as f:
+            pkl = pickle.load(f)
+            plddt = torch.tensor(pkl["plddt"], dtype=torch.float32) / 100.0  # normalize to [0, 1]
+        # Concatenate plddt as additional column
+        if fixed.shape[0] != plddt.shape[0]:
+            raise RuntimeError(f"Length mismatch in {folder}: fixed_embedding={fixed.shape[0]}, plddt={plddt.shape[0]}")
+        out["fixed_embedding"] = torch.cat([fixed, plddt.unsqueeze(-1)], dim=-1)
+        # Load pair features
+        out["pair"] = torch.load(os.path.join(folder, "pair.pt")).float()
+        # Load atom mask (from coordinate.pt)
+        coord_data = torch.load(os.path.join(folder, "coordinate.pt"))
+        out["atom_mask"] = coord_data["pos14_mask"].all(dim=-1).float()
+        return out
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        sample_id = str(row["name"])
+        target = float(row["dTm"])
+        wt_data = self._load_feature_dict(sample_id, "wt_data")
+        mut_data = self._load_feature_dict(sample_id, "mut_data")
+        target = torch.tensor(target, dtype=torch.float32)
+        return wt_data, mut_data, target
+
+
+###############################################################################
+# Model and Training Logic (copied from train_geodtm_no_plddt.py)
 ###############################################################################
 
 class GeoDTmModel(nn.Module):
-    """
-    GeoDTm-style model:
-
-    - Shared geometric encoder for wild-type and mutant.
-    - Masked mean pooling to get per-protein embeddings.
-    - ΔTm = MLP( z_mut - z_wt ).
-    """
     def __init__(self, node_dim: int, n_head: int, pair_dim: int, num_layer: int):
         super().__init__()
-
-        # Geometric encoder (same architecture as GeoFitness encoder)
         self.encoder = PretrainEncoder(node_dim, n_head, pair_dim, num_layer)
-
-        # Small MLP head on top of encoder pooled difference
         self.head = nn.Sequential(
             nn.LayerNorm(node_dim),
             nn.Linear(node_dim, node_dim),
@@ -40,174 +85,50 @@ class GeoDTmModel(nn.Module):
 
     @staticmethod
     def _masked_mean(x: torch.Tensor, mask_1d: torch.Tensor) -> torch.Tensor:
-        """
-        x: [N, L, D]
-        mask_1d: [N, L] boolean
-        returns: [N, D]
-        """
-        mask = mask_1d.unsqueeze(-1)  # [N, L, 1]
+        mask = mask_1d.unsqueeze(-1)
         x = x * mask
         denom = mask.sum(dim=1).clamp(min=1.0)
         return x.sum(dim=1) / denom
 
-    def encode(self, data: Dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        Encode a single protein (batch) into [N, L, node_dim] then pool to [N, node_dim].
-        Uses the same pLDDT gating logic as PretrainModel from model.py.
-        """
-        # data keys: "dynamic_embedding", "fixed_embedding", "pair", "atom_mask"
-        # Add pLDDT gate (last channel of fixed_embedding)
+    def encode(self, data):
         plddt = torch.sign(torch.relu(data["fixed_embedding"][:, :, -1] - 0.7)).bool()
         atom_mask = torch.stack(
-            (data["atom_mask"], plddt.unsqueeze(-1).repeat(1, 1, data["atom_mask"].shape[-1])),
+            (data["atom_mask"].bool(), plddt.unsqueeze(-1).repeat(1, 1, data["atom_mask"].shape[-1])),
             dim=0,
         ).all(dim=0)
-
-        # Encoder produces [N, L, node_dim]
-        node_feat = self.encoder(
-            data["dynamic_embedding"],
-            data["pair"],
-            atom_mask,
-        )
-
-        # Mask for residues based on CA atom
-        res_mask = atom_mask[:, :, ATOM_CA]  # [N, L] boolean
-        pooled = self._masked_mean(node_feat, res_mask)  # [N, node_dim]
+        node_feat = self.encoder(data["dynamic_embedding"], data["pair"], atom_mask)
+        res_mask = atom_mask[:, :, ATOM_CA]
+        pooled = self._masked_mean(node_feat, res_mask)
         return pooled
 
-    def forward(
-        self,
-        wt_data: Dict[str, torch.Tensor],
-        mut_data: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """
-        Forward for a batch of samples.
-
-        Returns:
-            pred_dtm: [N] predicted ΔTm (mut - wt, in °C)
-        """
-        z_wt = self.encode(wt_data)   # [N, D]
-        z_mut = self.encode(mut_data) # [N, D]
-
-        delta = z_mut - z_wt          # anti-symmetric by construction
-        out = self.head(delta).squeeze(-1)  # [N]
+    def forward(self, wt_data, mut_data):
+        z_wt = self.encode(wt_data)
+        z_mut = self.encode(mut_data)
+        delta = z_mut - z_wt
+        out = self.head(delta).squeeze(-1)
         return out
 
-
-###############################################################################
-# Dataset for ΔTm (S4346 / S571)
-###############################################################################
-
-class GeoDTmDataset(Dataset):
-    """
-    Simple dataset that:
-
-    - Reads rows from S4346.csv or S571.csv
-    - For each row, loads WT and mutant features from .pt files
-      at paths based on sample_id.
-
-    Expected CSV columns:
-        sample_id: unique identifier used to locate feature files
-        dtm:       experimental ΔTm value (float, °C)
-
-    Feature files:
-        <features_dir>/<sample_id>_wt.pt
-        <features_dir>/<sample_id>_mut.pt
-
-    Each .pt should be a dict with keys:
-        "dynamic_embedding", "fixed_embedding", "pair", "atom_mask"
-    """
-    def __init__(self, csv_path: str, features_dir: str):
-        super().__init__()
-        self.df = pd.read_csv(csv_path)
-        self.features_dir = features_dir
-
-        # adapt these if your column names differ
-        if "name" not in self.df.columns:
-            raise ValueError("CSV must contain a 'name' column.")
-        if "dtm" not in self.df.columns:
-            raise ValueError("CSV must contain a 'dtm' column with ΔTm values.")
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        sample_id = str(row["name"])
-        target = float(row["dtm"])
-
-        wt_path = os.path.join(self.features_dir, f"{sample_id}_wt.pt")
-        mut_path = os.path.join(self.features_dir, f"{sample_id}_mut.pt")
-
-        wt_data = torch.load(wt_path)
-        mut_data = torch.load(mut_path)
-
-        # convert all tensors to float32, etc. (assuming they are already tensors)
-        for k in wt_data:
-            if isinstance(wt_data[k], torch.Tensor):
-                wt_data[k] = wt_data[k].float()
-        for k in mut_data:
-            if isinstance(mut_data[k], torch.Tensor):
-                mut_data[k] = mut_data[k].float()
-
-        target = torch.tensor(target, dtype=torch.float32)
-        return wt_data, mut_data, target
-
-
-###############################################################################
-# Soft Spearman loss (approx) + MSE
-###############################################################################
-
 def soft_rank(x: torch.Tensor, regularization_strength: float = 1.0) -> torch.Tensor:
-    """
-    Simple differentiable approximate rank using a pairwise sigmoid kernel.
-    Not exactly Blondel et al.'s algorithm, but a common soft-rank surrogate.
-
-    x: [N]
-    returns: [N] approximate ranks in [1, N]
-    """
-    x = x.unsqueeze(0)  # [1, N]
-    diff = x.T - x      # [N, N]
+    x = x.unsqueeze(0)
+    diff = x.T - x
     P = torch.sigmoid(diff * regularization_strength)
-    # expected rank ~ 1 + sum_j P_ij
     ranks = 1 + P.sum(dim=1)
     return ranks
 
-
 def spearman_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """
-    Approximate Spearman correlation as a loss = 1 - ρ.
-
-    pred, target: [N]
-    """
-    # center both
     pred_r = soft_rank(pred)
     targ_r = soft_rank(target)
-
     pred_r = pred_r - pred_r.mean()
     targ_r = targ_r - targ_r.mean()
-
     pred_r = pred_r / (pred_r.norm(p=2) + 1e-8)
     targ_r = targ_r / (targ_r.norm(p=2) + 1e-8)
-
     rho = (pred_r * targ_r).sum()
-    return 1.0 - rho  # want to maximize ρ → minimize 1-ρ
-
+    return 1.0 - rho
 
 def dtm_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.5) -> torch.Tensor:
-    """
-    Conjugated loss: L = α * (1 - Spearman) + (1 - α) * MSE
-
-    Paper: use soft Spearman + MSE for ∆∆G / ∆Tm training. :contentReference[oaicite:6]{index=6}
-    """
     loss_spear = spearman_loss(pred, target)
     loss_mse = F.mse_loss(pred, target)
     return alpha * loss_spear + (1.0 - alpha) * loss_mse
-
-
-###############################################################################
-# Training / evaluation loops
-###############################################################################
 
 def move_batch_to_device(batch, device):
     wt_data, mut_data, target = batch
@@ -218,53 +139,36 @@ def move_batch_to_device(batch, device):
     target = target.to(device)
     return wt_data, mut_data, target
 
-
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer = None,
     device: torch.device = torch.device("cuda"),
     alpha_loss: float = 0.5,
-) -> Tuple[float, float, float]:
-    """
-    One epoch over loader.
-
-    Returns:
-        mean_loss, mse, spearman (on full epoch).
-    """
+) -> tuple:
     is_train = optimizer is not None
     model.train(is_train)
-
     all_preds = []
     all_targets = []
     total_loss = 0.0
     n_samples = 0
-
     for batch in loader:
         wt_data, mut_data, target = move_batch_to_device(batch, device)
-
         pred = model(wt_data, mut_data)
         loss = dtm_loss(pred, target, alpha=alpha_loss)
-
         if is_train:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
         bs = target.shape[0]
         total_loss += loss.item() * bs
         n_samples += bs
-
         all_preds.append(pred.detach().cpu())
         all_targets.append(target.detach().cpu())
 
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
-
-    # Compute epoch-level MSE and Spearman for logging
     mse = F.mse_loss(all_preds, all_targets).item()
-
-    # Spearman via (non-differentiable) rank
     pred_rank = torch.argsort(torch.argsort(all_preds))
     targ_rank = torch.argsort(torch.argsort(all_targets))
     pred_rank = pred_rank.float() - pred_rank.float().mean()
@@ -272,41 +176,26 @@ def run_epoch(
     pred_rank /= (pred_rank.norm(p=2) + 1e-8)
     targ_rank /= (targ_rank.norm(p=2) + 1e-8)
     rho = (pred_rank * targ_rank).sum().item()
-
     return total_loss / max(n_samples, 1), mse, rho
-
-
-###############################################################################
-# Main training routine
-###############################################################################
 
 def load_pretrained_encoder(
     model: GeoDTmModel,
     geofitness_ckpt: str,
     device: torch.device,
 ):
-    """
-    Load encoder weights from a pretrained GeoFitness checkpoint.
-
-    Assumes checkpoint was saved with PretrainModel from model.py, whose
-    state_dict contains 'pretrain_encoder.*'. :contentReference[oaicite:7]{index=7}
-    """
-    print(f"Loading pretrained GeoFitness from {geofitness_ckpt}")
+    print(f"Loading pretrained GeoFitness from {geofitness_ckpt}", flush=True)
     ckpt = torch.load(geofitness_ckpt, map_location=device)
     if isinstance(ckpt, nn.Module):
         state = ckpt.state_dict()
     else:
         state = ckpt
-
     encoder_state = {}
     for k, v in state.items():
         if k.startswith("pretrain_encoder."):
             new_k = k[len("pretrain_encoder.") :]
             encoder_state[new_k] = v
-
     missing, unexpected = model.encoder.load_state_dict(encoder_state, strict=False)
-    print("Loaded encoder from GeoFitness. Missing:", missing, "Unexpected:", unexpected)
-
+    print("Loaded encoder from GeoFitness. Missing:", missing, "Unexpected:", unexpected, flush=True)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -314,15 +203,14 @@ def main():
                         help="Training CSV (ΔTm training data)")
     parser.add_argument("--test_csv", type=str, default="/projects/ashehu/amoldwin/datasets/protein_melting_temps/S571.csv",
                         help="Test CSV (ΔTm benchmark)")
-    parser.add_argument("--features_dir", type=str, required=True,
-                        help="Directory containing <sample_id>_wt.pt and <sample_id>_mut.pt")
-    parser.add_argument("--geofitness_ckpt", type=str, required=True,
-                        help="Path to pretrained GeoFitness .pt")
+    parser.add_argument("--features_dir", type=str, default="/projects/ashehu/amoldwin/GeoStab/data/dTm/S4346/",
+                        help="Directory containing per-sample folders e.g. <features_dir>/<sample_id>/wt_data/esm2.pt")
+    parser.add_argument("--geofitness_ckpt", type=str, default=None, help="Path to pretrained GeoFitness .pt (optional)")
     parser.add_argument("--node_dim", type=int, default=64)
     parser.add_argument("--pair_dim", type=int, default=32)
     parser.add_argument("--n_head", type=int, default=8)
     parser.add_argument("--num_layer", type=int, default=2)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--epochs_frozen", type=int, default=5,
                         help="Number of epochs with encoder frozen (pretraining stage)")
@@ -339,26 +227,36 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # Load datasets
-    full_train = GeoDTmDataset(args.train_csv, args.features_dir)
-    # Simple split S4346 → train/val internally (e.g. 90/10)
-    val_frac = 0.1
-    n_total = len(full_train)
-    n_val = max(1, int(math.ceil(n_total * val_frac)))
-    n_train = n_total - n_val
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_train,
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(0),
-    )
+    full_df = pd.read_csv(args.train_csv)
+    # Column that identifies the *protein*, not the individual mutant
+    full_df['protein'] = full_df['name'].apply(lambda x: x.split('_')[1])
+    protein_col = "protein"
+    assert protein_col in full_df.columns, f"{protein_col} not in train CSV"
 
-    test_ds = GeoDTmDataset(args.test_csv, args.features_dir)
+    val_frac = 0.1
+    proteins = full_df[protein_col].unique()
+    rng = np.random.default_rng(0)
+    rng.shuffle(proteins)
+
+    n_val_prot = max(1, int(math.ceil(len(proteins) * val_frac)))
+    val_proteins = set(proteins[:n_val_prot])
+    train_proteins = set(proteins[n_val_prot:])
+
+    train_df = full_df[full_df[protein_col].isin(train_proteins)].reset_index(drop=True)
+    val_df   = full_df[full_df[protein_col].isin(val_proteins)].reset_index(drop=True)
+
+    print(f"Protein-disjoint split:")
+    print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
+    print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
+
+    train_ds = GeoDTmDataset(train_df, args.features_dir)
+    val_ds   = GeoDTmDataset(val_df,   args.features_dir)
+    test_ds  = GeoDTmDataset(args.test_csv, args.features_dir)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
 
-    # Build model
     model = GeoDTmModel(
         node_dim=args.node_dim,
         n_head=args.n_head,
@@ -366,10 +264,11 @@ def main():
         num_layer=args.num_layer,
     ).to(device)
 
-    # Load pretrained encoder
-    load_pretrained_encoder(model, args.geofitness_ckpt, device=device)
+    if args.geofitness_ckpt and os.path.isfile(args.geofitness_ckpt):
+        load_pretrained_encoder(model, args.geofitness_ckpt, device=device)
+    else:
+        print("No geofitness_ckpt provided. Training encoder from scratch.")
 
-    # Optimizer and scheduler
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
@@ -382,10 +281,7 @@ def main():
     best_path = os.path.join(args.out_dir, "geodtm_best.pt")
     early_counter = 0
 
-    # -----------------------------
-    # Stage 1: encoder frozen
-    # -----------------------------
-    print("Stage 1: Freezing encoder for rapid head optimization (GeoDTm, as in paper).")
+    print("Stage 1: Freezing encoder for rapid head optimization (GeoDTm, as in paper).", flush=True)
     for p in model.encoder.parameters():
         p.requires_grad = False
 
@@ -402,7 +298,7 @@ def main():
             f"[Frozen] Epoch {epoch:03d} | "
             f"Train loss {train_loss:.4f} | Val loss {val_loss:.4f} | "
             f"Val MSE {val_mse:.4f} | Val Spearman {val_rho:.3f}"
-        )
+        , flush=True)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -411,13 +307,10 @@ def main():
         else:
             early_counter += 1
             if early_counter >= args.early_stop:
-                print("Early stopping (frozen stage).")
+                print("Early stopping (frozen stage).", flush=True)
                 break
 
-    # -----------------------------
-    # Stage 2: fine-tune all params
-    # -----------------------------
-    print("Stage 2: Unfreezing encoder for joint fine-tuning.")
+    print("Stage 2: Unfreezing encoder for joint fine-tuning.", flush=True)
     for p in model.encoder.parameters():
         p.requires_grad = True
 
@@ -435,7 +328,7 @@ def main():
             f"[Finetune] Epoch {epoch:03d} | "
             f"Train loss {train_loss:.4f} | Val loss {val_loss:.4f} | "
             f"Val MSE {val_mse:.4f} | Val Spearman {val_rho:.3f}"
-        )
+        , flush=True)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -444,13 +337,10 @@ def main():
         else:
             early_counter += 1
             if early_counter >= args.early_stop:
-                print("Early stopping (fine-tune stage).")
+                print("Early stopping (fine-tune stage).", flush=True)
                 break
 
-    # -----------------------------
-    # Final test on S571
-    # -----------------------------
-    print(f"Loading best model from {best_path} for test evaluation (S571).")
+    print(f"Loading best model from {best_path} for test evaluation (S571).", flush=True)
     model.load_state_dict(torch.load(best_path, map_location=device))
 
     test_loss, test_mse, test_rho = run_epoch(
@@ -458,8 +348,7 @@ def main():
     )
     print(
         f"Test (S571) | Loss {test_loss:.4f} | MSE {test_mse:.4f} | Spearman {test_rho:.3f}"
-    )
-
+    , flush=True)
 
 if __name__ == "__main__":
     main()

@@ -66,7 +66,7 @@ def run_coordinate_and_pair(sample_dirs):
         for variant in ["wt_data", "mut_data"]:
             print(f"running coordinate and pair for: {variant} ", flush=True)
             vdir = os.path.join(sample_dir, variant)
-            pdb = "wt_esmfold.pdb" if variant == "wt_data" else "mut.pdb"
+            pdb = "wt_esmf.pdb" if variant == "wt_data" else "mut_esmf.pdb"
             pdbpath = os.path.join(vdir, pdb)
             coord_path = os.path.join(vdir, "coordinate.pt")
             pair_path = os.path.join(vdir, "pair.pt")
@@ -99,8 +99,8 @@ def main():
     mut_fastas, mut_dirs = collect_variant_fastas(sample_dirs, "mut_data")
 
     # Step 3: Batch DL models
-    print("Batching ESM2...", flush=True)
-    batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
+    # print("Batching ESM2...", flush=True)
+    # batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
     
     
     #removing because esm1v not 
