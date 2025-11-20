@@ -32,43 +32,108 @@ class GeoDTmDataset(Dataset):
 
     def _load_feature_dict(self, sample_id: str, variant: str):
         folder = os.path.join(self.features_dir, sample_id, variant)
+
         out = {}
         # Load ESM2 embedding
-        out["dynamic_embedding"] = torch.load(os.path.join(folder, "esm2.pt")).float()
-        # Load physicochemical fixed embedding (this defines the "true" sequence length)
-        fixed = torch.load(os.path.join(folder, "fixed_embedding.pt")).float()
+        out["dynamic_embedding"] = torch.load(
+            os.path.join(folder, "esm2.pt")
+        ).float()
+
+        # Load physicochemical fixed embedding (defines the "true" sequence length)
+        fixed = torch.load(
+            os.path.join(folder, "fixed_embedding.pt")
+        ).float()
         L_fixed = fixed.shape[0]
 
+        # ------------------------------------------------------------------
         # Load pLDDT from ESMFold pickle
+        # ------------------------------------------------------------------
         pkl_filename = "wt_esmf.pkl" if variant == "wt_data" else "mut_esmf.pkl"
         pkl_path = os.path.join(folder, pkl_filename)
         with open(pkl_path, "rb") as f:
             pkl = pickle.load(f)
             plddt_raw = torch.tensor(pkl["plddt"], dtype=torch.float32)
-            # Remove batch dim if present
-            if plddt_raw.ndim == 2 and plddt_raw.shape[0] == 1:
-                plddt_raw = plddt_raw[0]
 
-        L_fixed = fixed.shape[0]
+        # ------------------------------------------------------------------
+        # Normalize shapes:
+        #  - (L,)           -> already per-residue pLDDT
+        #  - (L, 37)        -> logits over 37 bins -> collapse to scalar
+        #  - (1, L)/(L, 1)  -> squeeze to (L,)
+        # Anything else raises.
+        # ------------------------------------------------------------------
+        if plddt_raw.dim() == 1:
+            # (L,) already good
+            pass
+
+        elif plddt_raw.dim() == 2:
+            # (L, 37): per-residue logits over 37 bins
+            if plddt_raw.shape[1] == 37:
+                L, K = plddt_raw.shape
+                bins = torch.arange(K, dtype=plddt_raw.dtype)  # 0..36
+                probs = plddt_raw.softmax(-1)                  # (L, 37)
+                # expected bin index * (100/36) -> pLDDT in [0, 100]
+                plddt_raw = (probs * bins).sum(-1) * (100.0 / 36.0)  # (L,)
+
+            # (1, L) or (L, 1): just squeeze to 1D
+            elif plddt_raw.shape[0] == 1 or plddt_raw.shape[1] == 1:
+                plddt_raw = plddt_raw.view(-1)
+
+            else:
+                raise ValueError(
+                    f"Unexpected 2D pLDDT shape {pldddt_raw.shape} in {pkl_path}"
+                )
+
+        else:
+            raise ValueError(
+                f"Unexpected pLDDT tensor rank {plddt_raw.dim()} with shape "
+                f"{plddt_raw.shape} in {pkl_path}"
+            )
+
+        # Now plddt_raw is 1D: (L_plddt,)
         L_plddt = plddt_raw.shape[0]
 
-        # Fix length mismatch if needed
-        if L_plddt != L_fixed:
-            if L_plddt > L_fixed:
-                print(f"[GeoDTmDataset] Cropping pLDDT from {L_plddt} to {L_fixed} for {folder}", flush=True)
-                plddt_raw = plddt_raw[:L_fixed]
+        # ------------------------------------------------------------------
+        # Fix length to match fixed_embedding length
+        # ------------------------------------------------------------------
+        if L_plddt > L_fixed:
+            # print(
+            #     f"[GeoDTmDataset] Cropping pLDDT from {L_plddt} to {L_fixed} "
+            #     f"in {folder}",
+            #     flush=True,
+            # )
+            plddt_raw = plddt_raw[:L_fixed]
+
+        elif L_plddt < L_fixed:
+            print(
+                f"[GeoDTmDataset] WARNING: pLDDT shorter ({L_plddt}) than "
+                f"fixed_embedding ({L_fixed}) in {folder}. Padding.",
+                flush=True,
+            )
+            if L_plddt > 0:
+                pad_val = plddt_raw[-1]
             else:
-                print(f"[GeoDTmDataset] WARNING: pLDDT shorter ({L_plddt}) than fixed_embedding ({L_fixed}) for {folder}. Padding.", flush=True)
-                pad = plddt_raw[-1].repeat(L_fixed - L_plddt)
-                plddt_raw = torch.cat([plddt_raw, pad], dim=0)
-        plddt = plddt_raw / 100.0
-        out["fixed_embedding"] = torch.cat([fixed, plddt.unsqueeze(-1)], dim=-1)
+                pad_val = torch.tensor(0.0, dtype=plddt_raw.dtype)
+            pad = pad_val.repeat(L_fixed - L_plddt)
+            plddt_raw = torch.cat([plddt_raw, pad], dim=0)
+
+        # Normalize to [0, 1] and append as final feature column
+        plddt = plddt_raw / 100.0  # (L_fixed,)
+        out["fixed_embedding"] = torch.cat(
+            [fixed, plddt.unsqueeze(-1)], dim=-1
+        )
+
         # Load pair features
-        out["pair"] = torch.load(os.path.join(folder, "pair.pt")).float()
+        out["pair"] = torch.load(
+            os.path.join(folder, "pair.pt")
+        ).float()
+
         # Load atom mask (from coordinate.pt)
         coord_data = torch.load(os.path.join(folder, "coordinate.pt"))
         out["atom_mask"] = coord_data["pos14_mask"].all(dim=-1).float()
+
         return out
+
+
 
     def __len__(self):
         return len(self.df)
