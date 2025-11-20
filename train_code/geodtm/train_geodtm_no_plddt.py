@@ -29,14 +29,18 @@ class GeoDTmDataset(Dataset):
     The .pt files should be directly torch.load()-able.
     Experimental ΔTm target is loaded from the CSV.
     """
-    def __init__(self, csv_path: str, features_dir: str):
+    def __init__(self, csv_or_df, features_dir: str):
         super().__init__()
-        self.df = pd.read_csv(csv_path)
+        if isinstance(csv_or_df, pd.DataFrame):
+            self.df = csv_or_df.reset_index(drop=True)
+        else:
+            self.df = pd.read_csv(csv_or_df)
+
         self.features_dir = features_dir
 
-        # adapt these if your column names differ
         assert "name" in self.df.columns, "CSV must contain a 'name' column."
         assert "dTm" in self.df.columns, "CSV must contain a 'dTm' column with ΔTm values."
+
 
     def _load_feature_dict(self, sample_id: str, variant: str):
         folder = os.path.join(self.features_dir, sample_id, variant)
@@ -244,22 +248,43 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     # Load datasets
-    full_train = GeoDTmDataset(args.train_csv, args.features_dir)
-    val_frac = 0.1
-    n_total = len(full_train)
-    n_val = max(1, int(math.ceil(n_total * val_frac)))
-    n_train = n_total - n_val
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_train,
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(0),
-    )
+        # Load full training CSV as DataFrame
+    full_df = pd.read_csv(args.train_csv)
 
-    test_ds = GeoDTmDataset(args.test_csv, args.features_dir)
+    # Column that identifies the *protein*, not the individual mutant
+    
+    full_df['protein']=full_df['name'].apply(lambda x: x.split('_')[1])
+    protein_col = "protein"  # <-- change if needed
+
+    assert protein_col in full_df.columns, f"{protein_col} not in train CSV"
+
+    # Get unique proteins and split them into train / val sets
+    val_frac = 0.1
+    proteins = full_df[protein_col].unique()
+    rng = np.random.default_rng(0)
+    rng.shuffle(proteins)
+
+    n_val_prot = max(1, int(math.ceil(len(proteins) * val_frac)))
+    val_proteins = set(proteins[:n_val_prot])
+    train_proteins = set(proteins[n_val_prot:])
+
+    train_df = full_df[full_df[protein_col].isin(train_proteins)].reset_index(drop=True)
+    val_df   = full_df[full_df[protein_col].isin(val_proteins)].reset_index(drop=True)
+
+    print(f"Protein-disjoint split:")
+    print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
+    print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
+
+    # Build datasets from DataFrames
+    train_ds = GeoDTmDataset(train_df, args.features_dir)
+    val_ds   = GeoDTmDataset(val_df,   args.features_dir)
+
+    # Test set remains as is (S571)
+    test_ds  = GeoDTmDataset(args.test_csv, args.features_dir)
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
 
     model = GeoDTmModel(
         node_dim=args.node_dim,
