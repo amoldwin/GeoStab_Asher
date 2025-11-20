@@ -36,18 +36,46 @@ class GeoDTmDataset(Dataset):
         out = {}
         # Load ESM2 embedding
         out["dynamic_embedding"] = torch.load(os.path.join(folder, "esm2.pt")).float()
-        # Load physicochemical fixed embedding
+        # Load physicochemical fixed embedding (this defines the "true" sequence length)
         fixed = torch.load(os.path.join(folder, "fixed_embedding.pt")).float()
+        L_fixed = fixed.shape[0]
+
         # Load pLDDT from ESMFold pickle
         pkl_filename = "wt_esmf.pkl" if variant == "wt_data" else "mut_esmf.pkl"
         pkl_path = os.path.join(folder, pkl_filename)
         with open(pkl_path, "rb") as f:
             pkl = pickle.load(f)
-            plddt = torch.tensor(pkl["plddt"], dtype=torch.float32) / 100.0  # normalize to [0, 1]
-        # Concatenate plddt as additional column
-        if fixed.shape[0] != plddt.shape[0]:
-            raise RuntimeError(f"Length mismatch in {folder}: fixed_embedding={fixed.shape[0]}, plddt={plddt.shape[0]}")
+            plddt_raw = torch.tensor(pkl["plddt"], dtype=torch.float32)
+
+        L_plddt = plddt_raw.shape[0]
+
+        # --- Fix pLDDT length to match fixed_embedding length ---
+        if L_plddt != L_fixed:
+            if L_plddt > L_fixed:
+                # Most common case: batched ESMFold padded up to max length in batch
+                print(
+                    f"[GeoDTmDataset] Cropping pLDDT from {L_plddt} to {L_fixed} "
+                    f"for {folder}",
+                    flush=True,
+                )
+                plddt_raw = plddt_raw[:L_fixed]
+            else:
+                # Unusual: pLDDT shorter than fixed_embedding
+                # Pad with last value (or zeros, if you prefer) and warn
+                print(
+                    f"[GeoDTmDataset] WARNING: pLDDT shorter ({L_plddt}) than "
+                    f"fixed_embedding ({L_fixed}) for {folder}. Padding.",
+                    flush=True,
+                )
+                pad = plddt_raw[-1].repeat(L_fixed - L_plddt)
+                plddt_raw = torch.cat([plddt_raw, pad], dim=0)
+
+        # Normalize to [0, 1]
+        plddt = plddt_raw / 100.0
+
+        # Concatenate pLDDT as additional column
         out["fixed_embedding"] = torch.cat([fixed, plddt.unsqueeze(-1)], dim=-1)
+
         # Load pair features
         out["pair"] = torch.load(os.path.join(folder, "pair.pt")).float()
         # Load atom mask (from coordinate.pt)
