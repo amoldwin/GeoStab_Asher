@@ -63,8 +63,8 @@ class GeoDTmAblationDataset(Dataset):
 
         # Atom mask from coordinate.pt
         coord_data = torch.load(os.path.join(folder, "coordinate.pt"))
-        atom_mask = coord_data["pos14_mask"].all(dim=-1).float()
-        feature_dict["atom_mask"] = atom_mask if self.use_atom_mask else torch.ones_like(atom_mask)
+        atom_mask = coord_data["pos14_mask"].all(dim=-1)  # already bool
+        feature_dict["atom_mask"] = atom_mask if self.use_atom_mask else torch.ones_like(atom_mask, dtype=torch.bool)
 
         # pH feature (expand to [L, 1])
         ph_val = 7.0
