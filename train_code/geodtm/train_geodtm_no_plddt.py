@@ -241,6 +241,8 @@ def main():
     parser.add_argument("--early_stop", type=int, default=10)
     parser.add_argument("--out_dir", type=str, default="geodtm_models")
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--job_id", type=str, default="default_job", help="Unique job/run ID for wandb logging.")
+
 
     args = parser.parse_args()
 
@@ -253,32 +255,45 @@ def main():
 
     # Column that identifies the *protein*, not the individual mutant
     
-    full_df['protein']=full_df['name'].apply(lambda x: x.split('_')[1])
-    protein_col = "protein"  # <-- change if needed
+#     full_df['protein']=full_df['name'].apply(lambda x: x.split('_')[1])
+#     protein_col = "protein"  # <-- change if needed
 
-    assert protein_col in full_df.columns, f"{protein_col} not in train CSV"
+#     assert protein_col in full_df.columns, f"{protein_col} not in train CSV"
 
-    # Get unique proteins and split them into train / val sets
-    val_frac = 0.1
-    proteins = full_df[protein_col].unique()
-    rng = np.random.default_rng(0)
-    rng.shuffle(proteins)
+#     # Get unique proteins and split them into train / val sets
+#     val_frac = 0.1
+#     proteins = full_df[protein_col].unique()
+#     rng = np.random.default_rng(0)
+#     rng.shuffle(proteins)
 
-    n_val_prot = max(1, int(math.ceil(len(proteins) * val_frac)))
-    val_proteins = set(proteins[:n_val_prot])
-    train_proteins = set(proteins[n_val_prot:])
+#     n_val_prot = max(1, int(math.ceil(len(proteins) * val_frac)))
+#     val_proteins = set(proteins[:n_val_prot])
+#     train_proteins = set(proteins[n_val_prot:])
 
-    train_df = full_df[full_df[protein_col].isin(train_proteins)].reset_index(drop=True)
-    val_df   = full_df[full_df[protein_col].isin(val_proteins)].reset_index(drop=True)
+#     train_df = full_df[full_df[protein_col].isin(train_proteins)].reset_index(drop=True)
+#     val_df   = full_df[full_df[protein_col].isin(val_proteins)].reset_index(drop=True)
 
-    print(f"Protein-disjoint split:")
-    print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
-    print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
+
+
+    
+#     print(f"Protein-disjoint split:")
+#     print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
+#     print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
 
     # Build datasets from DataFrames
-    train_ds = GeoDTmDataset(train_df, args.features_dir)
-    val_ds   = GeoDTmDataset(val_df,   args.features_dir)
-
+    # train_ds = GeoDTmDataset(train_df, args.features_dir)
+    # val_ds   = GeoDTmDataset(val_df,   args.features_dir)
+    full_train = GeoDTmDataset(args.train_csv, args.features_dir)
+    val_frac = 0.1
+    n_total = len(full_train)
+    n_val = max(1, int(math.ceil(n_total * val_frac)))
+    n_train = n_total - n_val
+    train_ds, val_ds = torch.utils.data.random_split(
+        full_train,
+        [n_train, n_val],
+        generator=torch.Generator().manual_seed(0),
+    )
+    
     # Test set remains as is (S571)
     test_ds  = GeoDTmDataset(args.test_csv, args.features_dir)
 
@@ -307,7 +322,7 @@ def main():
     )
 
     best_val_loss = float("inf")
-    best_path = os.path.join(args.out_dir, "geodtm_best.pt")
+    best_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_best.pt")
     early_counter = 0
 
     print("Stage 1: Freezing encoder for rapid head optimization (GeoDTm, as in paper).", flush=True)
@@ -378,6 +393,36 @@ def main():
     print(
         f"Test (S571) | Loss {test_loss:.4f} | MSE {test_mse:.4f} | Spearman {test_rho:.3f}"
     , flush=True)
+    # -------------------------------------------------------
+    # Save test predictions to CSV
+    # -------------------------------------------------------
+    print("Generating test-set predictions and saving CSV...", flush=True)
+
+    model.eval()
+    test_names = []
+    test_preds = []
+    test_targets = []
+
+    with torch.no_grad():
+        for i, batch in enumerate(test_loader):
+            wt_data, mut_data, target = move_batch_to_device(batch, device)
+            pred = model(wt_data, mut_data)
+
+            # extract sample name from original test dataframe
+            sample_name = test_ds.df.iloc[i]["name"]
+
+            test_names.append(sample_name)
+            test_preds.append(float(pred.cpu().item()))
+            test_targets.append(float(target.cpu().item()))
+
+    out_csv = os.path.join(args.out_dir, f"{args.job_id}_geodtm_test_predictions.csv")
+    pd.DataFrame({
+        "name": test_names,
+        "model_score": test_preds,
+        "true_label": test_targets,
+    }).to_csv(out_csv, index=False)
+
+    print(f"Saved test predictions to: {out_csv}", flush=True)
 
 if __name__ == "__main__":
     main()
