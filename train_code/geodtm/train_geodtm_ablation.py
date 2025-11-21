@@ -142,7 +142,10 @@ class GeoDTmAblationModel(nn.Module):
         self.fixed_dim = fixed_dim
         self.node_dim = node_dim
 
-        # Adjust embedding of fixed features for ablation
+        # Add this line to fix error:
+        self.input_proj = nn.Linear(1280 + fixed_dim, node_dim)
+
+        # Adjust embedding of fixed features for ablation (if needed for other architectures)
         self.fixed_proj = nn.Sequential(
             nn.Linear(fixed_dim, node_dim),
             nn.LeakyReLU(),
