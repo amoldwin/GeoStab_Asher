@@ -160,11 +160,16 @@ class GeoDTmAblationModel(nn.Module):
         return x.sum(dim=1) / denom
 
     def encode(self, data):
-        dyn_emb = data["dynamic_embedding"].unsqueeze(0)      # [1, L, 1280]
-        pair = data["pair"].unsqueeze(0)
-        atom_mask = data["atom_mask"].unsqueeze(0)
-        # Pass only ESM2 embedding to encoder
-        node_feat = self.encoder(dyn_emb, pair, atom_mask)    # [1, L, node_dim]
+        dyn_emb = data["dynamic_embedding"]
+        if dyn_emb.dim() == 2:
+            dyn_emb = dyn_emb.unsqueeze(0)
+        pair = data["pair"]
+        if pair.dim() == 3:
+            pair = pair.unsqueeze(0)
+        atom_mask = data["atom_mask"]
+        if atom_mask.dim() == 2:
+            atom_mask = atom_mask.unsqueeze(0)
+        node_feat = self.encoder(dyn_emb, pair, atom_mask)
         res_mask = atom_mask[:, :, ATOM_CA]
         pooled = self._masked_mean(node_feat, res_mask)
         return pooled
