@@ -160,18 +160,11 @@ class GeoDTmAblationModel(nn.Module):
         return x.sum(dim=1) / denom
 
     def encode(self, data):
-        # If ablating dynamic_embedding, it's zeros. If ablating fixed, it's zeros.
-        # Project both to node_dim if needed, then sum, or concatenate then project.
-        dyn_emb = data["dynamic_embedding"].unsqueeze(0)    # [1, L, 1280]
-        fixed_full = data["fixed_full"].unsqueeze(0)         # [1, L, fixed_dim]
-
-        # Concatenate and project to node_dim
-        x_in = torch.cat([dyn_emb, fixed_full], dim=-1)      # [1, L, 1280 + fixed_dim]
-        x_in = self.input_proj(x_in)                         # [1, L, node_dim]
-
+        dyn_emb = data["dynamic_embedding"].unsqueeze(0)      # [1, L, 1280]
         pair = data["pair"].unsqueeze(0)
         atom_mask = data["atom_mask"].unsqueeze(0)
-        node_feat = self.encoder(x_in, pair, atom_mask)
+        # Pass only ESM2 embedding to encoder
+        node_feat = self.encoder(dyn_emb, pair, atom_mask)    # [1, L, node_dim]
         res_mask = atom_mask[:, :, ATOM_CA]
         pooled = self._masked_mean(node_feat, res_mask)
         return pooled
