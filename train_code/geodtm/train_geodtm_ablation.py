@@ -305,15 +305,12 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
 
     
-    if args.seed=None:
-        seed = random.randint(1, 100)
-    else:
-        seed=args.seed
-    print(f"using seed:{seed}", flush=True)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    print(f"using seed:{args.seed}", flush=True)
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -343,7 +340,7 @@ def main():
     # Get unique proteins and split them into train / val sets
     val_frac = 0.1
     proteins = full_df[protein_col].unique()
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(args.seed)
     rng.shuffle(proteins)
 
     n_val_prot = max(1, int(math.ceil(len(proteins) * val_frac)))
