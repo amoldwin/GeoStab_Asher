@@ -9,6 +9,8 @@ import pandas as pd
 import numpy as np
 import pickle
 import sys
+import random
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../model_dTm_3D")))
 
 from model import PretrainEncoder, ATOM_CA
@@ -300,6 +302,20 @@ def main():
     parser.add_argument("--no_pH", action="store_false", dest="use_pH")
     parser.add_argument("--use_plddt", action="store_true", default=True)
     parser.add_argument("--no_plddt", action="store_false", dest="use_plddt")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+
+    
+    if args.seed=None:
+        seed = random.randint(1, 100)
+    else:
+        seed=args.seed
+    print(f"using seed:{seed}", flush=True)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
@@ -315,9 +331,35 @@ def main():
     if args.use_plddt: fixed_dim += 1
 
     # --- Data ---
-    full_train = GeoDTmAblationDataset(
-        args.train_csv,
-        args.features_dir,
+    # Load full training CSV as DataFrame
+    full_df = pd.read_csv(args.train_csv)
+
+    # Tag each entry with its protein name using name format
+    full_df['protein'] = full_df['name'].apply(lambda x: x.split('_')[1])
+    protein_col = "protein"  # <-- change if needed
+
+    assert protein_col in full_df.columns, f"{protein_col} not in train CSV"
+
+    # Get unique proteins and split them into train / val sets
+    val_frac = 0.1
+    proteins = full_df[protein_col].unique()
+    rng = np.random.default_rng(0)
+    rng.shuffle(proteins)
+
+    n_val_prot = max(1, int(math.ceil(len(proteins) * val_frac)))
+    val_proteins = set(proteins[:n_val_prot])
+    train_proteins = set(proteins[n_val_prot:])
+
+    train_df = full_df[full_df[protein_col].isin(train_proteins)].reset_index(drop=True)
+    val_df   = full_df[full_df[protein_col].isin(val_proteins)].reset_index(drop=True)
+
+    print(f"Protein-disjoint split:")
+    print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
+    print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
+
+    # Build datasets from DataFrames
+    train_ds = GeoDTmAblationDataset(
+        train_df, args.features_dir,
         use_fixed_embedding=args.use_fixed_embedding,
         use_dynamic_embedding=args.use_dynamic_embedding,
         use_pair=args.use_pair,
@@ -325,18 +367,17 @@ def main():
         use_pH=args.use_pH,
         use_plddt=args.use_plddt
     )
-    val_frac = 0.1
-    n_total = len(full_train)
-    n_val = max(1, int(math.ceil(n_total * val_frac)))
-    n_train = n_total - n_val
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_train,
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(0),
+    val_ds = GeoDTmAblationDataset(
+        val_df, args.features_dir,
+        use_fixed_embedding=args.use_fixed_embedding,
+        use_dynamic_embedding=args.use_dynamic_embedding,
+        use_pair=args.use_pair,
+        use_atom_mask=args.use_atom_mask,
+        use_pH=args.use_pH,
+        use_plddt=args.use_plddt
     )
     test_ds = GeoDTmAblationDataset(
-        args.test_csv,
-        args.features_dir,
+        args.test_csv, args.features_dir,
         use_fixed_embedding=args.use_fixed_embedding,
         use_dynamic_embedding=args.use_dynamic_embedding,
         use_pair=args.use_pair,
@@ -344,6 +385,7 @@ def main():
         use_pH=args.use_pH,
         use_plddt=args.use_plddt
     )
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)

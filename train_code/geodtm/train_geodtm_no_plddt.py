@@ -255,45 +255,32 @@ def main():
 
     # Column that identifies the *protein*, not the individual mutant
     
-#     full_df['protein']=full_df['name'].apply(lambda x: x.split('_')[1])
-#     protein_col = "protein"  # <-- change if needed
+    full_df['protein']=full_df['name'].apply(lambda x: x.split('_')[1])
+    protein_col = "protein"  # <-- change if needed
 
-#     assert protein_col in full_df.columns, f"{protein_col} not in train CSV"
+    assert protein_col in full_df.columns, f"{protein_col} not in train CSV"
 
-#     # Get unique proteins and split them into train / val sets
-#     val_frac = 0.1
-#     proteins = full_df[protein_col].unique()
-#     rng = np.random.default_rng(0)
-#     rng.shuffle(proteins)
+    # Get unique proteins and split them into train / val sets
+    val_frac = 0.1
+    proteins = full_df[protein_col].unique()
+    rng = np.random.default_rng(0)
+    rng.shuffle(proteins)
 
-#     n_val_prot = max(1, int(math.ceil(len(proteins) * val_frac)))
-#     val_proteins = set(proteins[:n_val_prot])
-#     train_proteins = set(proteins[n_val_prot:])
+    n_val_prot = max(1, int(math.ceil(len(proteins) * val_frac)))
+    val_proteins = set(proteins[:n_val_prot])
+    train_proteins = set(proteins[n_val_prot:])
 
-#     train_df = full_df[full_df[protein_col].isin(train_proteins)].reset_index(drop=True)
-#     val_df   = full_df[full_df[protein_col].isin(val_proteins)].reset_index(drop=True)
+    train_df = full_df[full_df[protein_col].isin(train_proteins)].reset_index(drop=True)
+    val_df   = full_df[full_df[protein_col].isin(val_proteins)].reset_index(drop=True)
 
-
-
-    
-#     print(f"Protein-disjoint split:")
-#     print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
-#     print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
+    print(f"Protein-disjoint split:")
+    print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
+    print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
 
     # Build datasets from DataFrames
-    # train_ds = GeoDTmDataset(train_df, args.features_dir)
-    # val_ds   = GeoDTmDataset(val_df,   args.features_dir)
-    full_train = GeoDTmDataset(args.train_csv, args.features_dir)
-    val_frac = 0.1
-    n_total = len(full_train)
-    n_val = max(1, int(math.ceil(n_total * val_frac)))
-    n_train = n_total - n_val
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_train,
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(0),
-    )
-    
+    train_ds = GeoDTmDataset(train_df, args.features_dir)
+    val_ds   = GeoDTmDataset(val_df,   args.features_dir)
+
     # Test set remains as is (S571)
     test_ds  = GeoDTmDataset(args.test_csv, args.features_dir)
 

@@ -55,7 +55,6 @@ def create_batched_job_dataset(
         yield batch_headers, batch_seqs, batch_pdbs, batch_pkls
 
 
-
 def main(
     data_parent: str,
     num_samples: Optional[int] = None,
@@ -63,6 +62,7 @@ def main(
     num_recycles: Optional[int] = None,
     chunk_size: Optional[int] = None,
     cpu_only: bool = False,
+    start_from_longest: bool = False,
 ):
     print("CUDA available:", torch.cuda.is_available(), flush=True)
 
@@ -81,8 +81,9 @@ def main(
 
     print(f"Loaded ESMFold model on {device}", flush=True)
 
-    # ---- Collect mutant jobs from data_parent ----
-    # We immediately read each mut.fasta to get (header, seq)
+    # ---- Collect jobs from data_parent ----
+    # We immediately read each mut.fasta to get (header, seq),
+    # but ONLY include samples whose pkl does NOT exist yet.
     jobs = []
     data_parent_path = Path(data_parent)
 
@@ -94,6 +95,10 @@ def main(
         mut_pkl = mut_dir / "mut_esmf.pkl"
 
         if mut_fasta.exists():
+            # Skip if the pkl already exists (another run already did this)
+            if mut_pkl.exists():
+                continue
+
             # Read single-record FASTA
             record = SeqIO.read(str(mut_fasta), "fasta")
             header = record.id
@@ -104,14 +109,15 @@ def main(
     if num_samples is not None:
         jobs = jobs[:num_samples]
 
-    # Sort by length like esmfold_inference for more efficient batching
-    jobs.sort(key=lambda x: len(x[1]))
+    # Sort by length for more efficient batching
+    # Default: shortest first; if start_from_longest=True, longest first.
+    jobs.sort(key=lambda x: len(x[1]), reverse=start_from_longest)
 
     total_jobs = len(jobs)
-    print(f"Will predict {total_jobs} mutant structures.", flush=True)
+    print(f"Will predict {total_jobs} mut structures (missing pkl files).", flush=True)
 
     if total_jobs == 0:
-        print("No mut.fasta files found; exiting.", flush=True)
+        print("No mut.fasta files needing pkl generation found; exiting.", flush=True)
         return
 
     # ---- Progress tracking ----
@@ -125,6 +131,25 @@ def main(
         batch_size = len(sequences)
         if batch_size == 0:
             continue
+
+        # --- Second check: drop jobs whose pkl appeared in the meantime ---
+        # (e.g., another process finished them while we were running earlier batches)
+        filtered = []
+        for h, s, pdb, pkl in zip(headers, sequences, pdb_paths, pkl_paths):
+            if os.path.exists(pkl):
+                # Treat as completed by somebody else
+                completed += 1
+                continue
+            filtered.append((h, s, pdb, pkl))
+
+        if not filtered:
+            # Everything in this batch was done concurrently elsewhere
+            continue
+
+        headers, sequences, pdb_paths, pkl_paths = zip(*filtered)
+        headers, sequences = list(headers), list(sequences)
+        pdb_paths, pkl_paths = list(pdb_paths), list(pkl_paths)
+        batch_size = len(sequences)
 
         try:
             # Call ESMFold in batch mode:
@@ -141,7 +166,7 @@ def main(
                     f"Consider lowering --max_tokens_per_batch.",
                     flush=True,
                 )
-                # Skip this batch; do not count these as completed
+                # Skip this batch; do not count these as completed (they still need work)
                 continue
             else:
                 print(
@@ -169,14 +194,16 @@ def main(
         for idx, (header, seq, pdb_str, pdb_path, pkl_path) in enumerate(
             zip(headers, sequences, pdb_strings, pdb_paths, pkl_paths)
         ):
-            # Save PDB
-            if True: ##not os.path.exists(pdb_path):
+            # It's possible (though unlikely) that another process wrote the pkl
+            # between our last check and now; we keep the check here as well.
+            # Save PDB only if it doesn't already exist
+            if not os.path.exists(pdb_path):
                 with open(pdb_path, "w") as f:
                     f.write(pdb_str)
                 print(f"Wrote {pdb_path}", flush=True)
 
-            # Save per-residue pLDDT to pickle
-            if True:#plddts is not None and not os.path.exists(pkl_path):
+            # Save per-residue pLDDT to pickle if available and doesn't exist yet
+            if plddts is not None and not os.path.exists(pkl_path):
                 plddt_vec = plddts[idx].numpy()
                 with open(pkl_path, "wb") as f:
                     pickle.dump({"plddt": plddt_vec}, f)
@@ -185,10 +212,10 @@ def main(
             # Update progress
             completed += 1
             elapsed = time.time() - start_time
-            avg_per_job = elapsed / completed
+            avg_per_job = elapsed / max(completed, 1)
             remaining = total_jobs - completed
             eta = remaining * avg_per_job
-            pct = 100.0 * completed / total_jobs
+            pct = 100.0 * completed / total_jobs if total_jobs > 0 else 100.0
 
             # Try to log mean pLDDT / pTM if available
             mean_pl = mean_plddt[idx].item() if mean_plddt is not None else float("nan")
@@ -241,6 +268,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Force CPU-only inference even if CUDA is available.",
     )
+    parser.add_argument(
+        "--start_from_longest",
+        action="store_true",
+        help="If set, process longest sequences first (default: shortest first).",
+    )
     args = parser.parse_args()
 
     main(
@@ -250,4 +282,5 @@ if __name__ == "__main__":
         num_recycles=args.num_recycles,
         chunk_size=args.chunk_size,
         cpu_only=args.cpu_only,
+        start_from_longest=args.start_from_longest,
     )
