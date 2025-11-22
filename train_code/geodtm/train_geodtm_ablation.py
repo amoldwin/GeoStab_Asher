@@ -305,6 +305,9 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
 
     
+  
+
+    args = parser.parse_args()
     print(f"using seed:{args.seed}", flush=True)
 
     random.seed(args.seed)
@@ -313,8 +316,6 @@ def main():
     torch.cuda.manual_seed_all(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
-    args = parser.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     suffix = ablation_suffix(args)
