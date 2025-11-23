@@ -32,7 +32,7 @@ class GeoPathoAblationDataset(Dataset):
         self.ph_col = ph_candidates[0] if ph_candidates else None
 
     def _load_feature_dict(self, row, variant: str):
-        sample_id = str(row["name"])
+        sample_id = str(row["prot_variant"])
         folder = os.path.join(self.features_dir, sample_id, variant)
         L = torch.load(os.path.join(folder, "esm2.pt")).shape[0]
         d_emb = torch.load(os.path.join(folder, "esm2.pt")).float()
@@ -339,12 +339,12 @@ def main():
             wt_data, mut_data, target = move_batch_to_device(batch, device)
             logits = model(wt_data, mut_data)
             prob = torch.sigmoid(logits).cpu().item()
-            sample_name = test_ds.df.iloc[i]["name"]
+            sample_name = test_ds.df.iloc[i]["prot_variant"]
             test_names.append(sample_name)
             test_preds.append(prob)
             test_targets.append(float(target.cpu().item()))
     pd.DataFrame({
-        "name": test_names,
+        "prot_variant": test_names,
         "model_score": test_preds,
         "true_label": test_targets,
     }).to_csv(test_csv_path, index=False)
