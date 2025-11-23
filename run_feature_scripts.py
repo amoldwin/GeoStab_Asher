@@ -4,7 +4,8 @@ from generate_features.esm2_embedding import run_esm2_embedding
 from generate_features.esm1v_logits import run_esm1v_logits
 
 FEATURE_SCRIPT_DIR = "generate_features"
-DATA_PARENT_DIR = "./data/dTm/S4346/"  # Change if needed
+# DATA_PARENT_DIR = "./data/dTm/S4346/"  # Change if needed
+DATA_PARENT_DIR = "./data/patho/patho_FASTA/"  # Change if needed
 
 def collect_variant_fastas(samples, variant):
     fasta_files = []
@@ -99,8 +100,8 @@ def main():
     mut_fastas, mut_dirs = collect_variant_fastas(sample_dirs, "mut_data")
 
     # Step 3: Batch DL models
-    # print("Batching ESM2...", flush=True)
-    # batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
+    print("Batching ESM2...", flush=True)
+    batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
     
     
     #removing because esm1v not 
@@ -108,7 +109,7 @@ def main():
     # batch_run_esm1v(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
 
     # Step 4: Lightweight features (fixed_embedding, coordinate, pair)
-    #run_fixed_embedding(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
+    run_fixed_embedding(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
     run_coordinate_and_pair(sample_dirs)
 
     # Step 5: Ensemble generation
