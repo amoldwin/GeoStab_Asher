@@ -49,6 +49,9 @@ class GeoPathoAblationDataset(Dataset):
         if self.use_pH and self.ph_col is not None:
             ph_val = float(row[self.ph_col])
             ph_val = max(0.0, min(11.0, ph_val))
+        if  self.ph_col is None:
+            # print("no pH col", flush=True)
+            ph_val = 7.0
         ph_feat = torch.full((L, 1), ph_val, dtype=torch.float32)
         pkl_filename = "wt_esmf.pkl" if variant == "wt_data" else "mut_esmf.pkl"
         pkl_path = os.path.join(folder, pkl_filename)
