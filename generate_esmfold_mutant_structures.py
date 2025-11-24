@@ -68,6 +68,8 @@ def main(
     chunk_size: Optional[int] = None,
     cpu_only: bool = False,
     start_from_longest: bool = False,
+    array_ID: Optional[int] = None,
+    array_N: Optional[int] = None,
 ):
     print("CUDA available:", torch.cuda.is_available(), flush=True)
 
@@ -110,6 +112,13 @@ def main(
         jobs = jobs[:num_samples]
 
     jobs.sort(key=lambda x: len(x[1]), reverse=start_from_longest)
+
+    # Partition jobs by SLURM array variables, if requested
+    total_jobs_orig = len(jobs)
+    if array_ID is not None and array_N is not None:
+        # Only process jobs where i % array_N == array_ID
+        jobs = [job for i, job in enumerate(jobs) if i % array_N == array_ID]
+        print(f"SLURM array partitioning: array_ID {array_ID}, array_N {array_N}, assigned jobs: {len(jobs)} (out of {total_jobs_orig})", flush=True)
 
     total_jobs = len(jobs)
     print(f"Will predict {total_jobs} mut structures (missing pkl files).", flush=True)
@@ -213,9 +222,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Get SLURM_ARRAY_TASK_ID if present
+    # Get SLURM_ARRAY_TASK_ID from environment if --ID not provided
     if args.ID is None:
-        import os
         slurm_id = os.environ.get("SLURM_ARRAY_TASK_ID", None)
         if slurm_id is not None:
             args.ID = int(slurm_id)
