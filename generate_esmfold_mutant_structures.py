@@ -200,46 +200,25 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--data_parent",
-        required=True,
-        help="Parent directory containing sample_name/mut_data/mut.fasta",
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=None,
-        help="Optional limit on number of mutants for debugging.",
-    )
-    parser.add_argument(
-        "--max_tokens_per_batch",
-        type=int,
-        default=1024,
-        help="Maximum total sequence length per ESMFold forward pass.",
-    )
-    parser.add_argument(
-        "--num_recycles",
-        type=int,
-        default=None,
-        help="Number of recycles to run (default: training value, typically 4).",
-    )
-    parser.add_argument(
-        "--chunk_size",
-        type=int,
-        default=None,
-        help="ESMFold axial attention chunk size (e.g. 128, 64) to reduce memory usage.",
-    )
-    parser.add_argument(
-        "--cpu_only",
-        action="store_true",
-        help="Force CPU-only inference even if CUDA is available.",
-    )
-    parser.add_argument(
-        "--start_from_longest",
-        action="store_true",
-        help="If set, process longest sequences first (default: shortest first).",
-    )
+    parser.add_argument("--data_parent", required=True)
+    parser.add_argument("--num_samples", type=int, default=None)
+    parser.add_argument("--max_tokens_per_batch", type=int, default=1024)
+    parser.add_argument("--num_recycles", type=int, default=None)
+    parser.add_argument("--chunk_size", type=int, default=None)
+    parser.add_argument("--cpu_only", action="store_true")
+    parser.add_argument("--start_from_longest", action="store_true")
+    # Array job parameters
+    parser.add_argument("--ID", type=int, default=None, help="SLURM array job index (0-based)")
+    parser.add_argument("--N", type=int, default=None, help="Total number of array jobs")
+
     args = parser.parse_args()
+
+    # Get SLURM_ARRAY_TASK_ID if present
+    if args.ID is None:
+        import os
+        slurm_id = os.environ.get("SLURM_ARRAY_TASK_ID", None)
+        if slurm_id is not None:
+            args.ID = int(slurm_id)
 
     main(
         data_parent=args.data_parent,
@@ -249,4 +228,6 @@ if __name__ == "__main__":
         chunk_size=args.chunk_size,
         cpu_only=args.cpu_only,
         start_from_longest=args.start_from_longest,
+        array_ID=args.ID,
+        array_N=args.N
     )

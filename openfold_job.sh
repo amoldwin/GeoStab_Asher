@@ -5,13 +5,13 @@
 #SBATCH --mail-user=<amoldwin@gmu.edu>
 #SBATCH --mail-type=BEGIN,END,FAIL
 
-#SBATCH --partition=gpuq        # contrib-gpuq, gpuq
+#SBATCH --partition=contrib-gpuq        # contrib-gpuq, gpuq
 #SBATCH --qos=gpu # gpu, cs_dept
 #SBATCH --nodes=1 
 #SBATCH --gres=gpu:A100.80gb:1
 ##SBATCH --gres=gpu:3g.40gb:1
 #SBATCH --mem=128G 
-#SBATCH --time=02-00:30:00
+#SBATCH --time=01-00:30:00
 
 
 # source /projects/ashehu/amoldwin/envs/mutation/bin/activate
