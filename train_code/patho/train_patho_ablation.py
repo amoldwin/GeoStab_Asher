@@ -253,11 +253,8 @@ def main():
     full_df   = pd.concat([train_df, val_df], axis=0, ignore_index=True)
 
     # Identify the per-protein (or per-variant) column
-    protein_col = "prot"  # or "protein" or "prot_variant" as appropriate
-    if "protein" not in full_df.columns and "prot_variant" in full_df.columns:
-        protein_col = "prot_variant"
-    else:
-        protein_col = "protein"
+    protein_col = "prot_acc_version"  # or "protein" or "prot_variant" as appropriate
+   
 
     # Get unique proteins/variants
     proteins = full_df[protein_col].unique()
