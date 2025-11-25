@@ -145,6 +145,8 @@ class PretrainGeometricAttention(torch.nn.Module):
                     torch.nn.Linear(channels2, self.alpha2pair[-2].out_channels),
                     torch.nn.LeakyReLU()
                 )
+            # Ensure the fallback module is on the correct device!
+            self.alpha2pair_fallback = self.alpha2pair_fallback.to(out_pair_input.device)
             out_pair_flat = out_pair_input.view(batch2, channels2)
             out_pair_out = self.alpha2pair_fallback(out_pair_flat)
             out_pair = out_pair_out.view(batch2, 1, 1, out_pair_out.shape[-1])
