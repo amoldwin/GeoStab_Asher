@@ -103,7 +103,7 @@ class PretrainGeometricAttention(torch.nn.Module):
 
         return node_from_pair
 
-def forward(self, x, z, mask):
+    def forward(self, x, z, mask):
         alpha_from_node = self._node2alpha(x)
         alpha_from_pair = self._pair2alpha(z)
         # shape: [batch, L, L, n_head]
@@ -111,15 +111,14 @@ def forward(self, x, z, mask):
         alpha_input = torch.cat((alpha_from_pair, alpha_from_node), dim=-1).permute(0, 3, 1, 2)  # [batch, channels, height, width]
         batch, channels, height, width = alpha_input.shape
 
+        # Handle singleton spatial dimension (height*width==1) for conv2dalpha
         if height * width > 1:
             alpha_sum = self.conv2dalpha(alpha_input).permute(0, 2, 3, 1)
         else:
             # fallback for singleton spatial input (LayerNorm+Linear)
             # input: [batch, channels, 1, 1] → [batch, channels]
             alpha_flat = alpha_input.view(batch, channels)
-            # fallback_norm applies LayerNorm+Linear+LeakyReLU and restores output shape
             alpha_out = self.fallback_norm(alpha_flat)  # [batch, n_head]
-            # put back spatial dims: [batch, 1, 1, n_head]
             alpha_sum = alpha_out.view(batch, 1, 1, self.n_head)
 
         N, L = alpha_sum.shape[:2]
@@ -132,7 +131,25 @@ def forward(self, x, z, mask):
         node_from_pair = self._pair_aggregation(alpha, z)
         x_out = self.out_transform(torch.cat([node_from_pair, node_from_node], dim=-1))
         x = self.layer_norm(x + x_out)
-        return x, self.alpha2pair(torch.cat((z, alpha), dim=-1).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+
+        # Handle singleton spatial dimension for alpha2pair as well!
+        out_pair_input = torch.cat((z, alpha), dim=-1).permute(0, 3, 1, 2)  # [batch, channels, height, width]
+        batch2, channels2, height2, width2 = out_pair_input.shape
+        if height2 * width2 > 1:
+            out_pair = self.alpha2pair(out_pair_input).permute(0, 2, 3, 1)
+        else:
+            # Fallback normalization: LayerNorm + Linear
+            if not hasattr(self, 'alpha2pair_fallback'):
+                self.alpha2pair_fallback = torch.nn.Sequential(
+                    torch.nn.LayerNorm(channels2),
+                    torch.nn.Linear(channels2, self.alpha2pair[-2].out_channels),
+                    torch.nn.LeakyReLU()
+                )
+            out_pair_flat = out_pair_input.view(batch2, channels2)
+            out_pair_out = self.alpha2pair_fallback(out_pair_flat)
+            out_pair = out_pair_out.view(batch2, 1, 1, out_pair_out.shape[-1])
+
+        return x, out_pair
 
 
 class PretrainEncoder(torch.nn.Module):
