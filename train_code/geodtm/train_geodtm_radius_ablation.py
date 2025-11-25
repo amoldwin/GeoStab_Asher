@@ -10,6 +10,9 @@ import numpy as np
 import pickle
 import sys
 import random
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../model_dTm_3D")))
 from model import PretrainEncoder, ATOM_CA

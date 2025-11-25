@@ -9,6 +9,8 @@ import torch.nn.functional as F
 import sys
 import random
 import pickle
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../model_dTm_3D")))
 from model import PretrainEncoder, ATOM_CA
@@ -233,8 +235,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     suffix = ablation_suffix(args)
-    best_path = os.path.join(args.out_dir, f"{args.job_id}_geopatho_best_{suffix}.pt")
-    test_csv_path = os.path.join(args.out_dir, f"{args.job_id}_geopatho_test_predictions_{suffix}.csv")
+    best_path = os.path.join(args.out_dir, f"{args.job_id}_geopatho_best_{suffix}_{args.seed}.pt")
+    test_csv_path = os.path.join(args.out_dir, f"{args.job_id}_geopatho_test_predictions_{suffix}_{args.seed}.csv")
     # fixed_full: 7+1+1 if all present, fewer if ablated
     fixed_dim = 0
     if args.use_fixed_embedding: fixed_dim += 7
@@ -242,7 +244,37 @@ def main():
     if args.use_plddt: fixed_dim += 1
 
     # Datasets
-    train_ds = GeoPathoAblationDataset(args.train_csv, args.features_dir,
+    # Load and concatenate train + val CSVs
+    train_df  = pd.read_csv(args.train_csv)
+    val_df    = pd.read_csv(args.val_csv)
+    full_df   = pd.concat([train_df, val_df], axis=0, ignore_index=True)
+
+    # Identify the per-protein (or per-variant) column
+    protein_col = "prot"  # or "protein" or "prot_variant" as appropriate
+    if "protein" not in full_df.columns and "prot_variant" in full_df.columns:
+        protein_col = "prot_variant"
+    else:
+        protein_col = "protein"
+
+    # Get unique proteins/variants
+    proteins = full_df[protein_col].unique()
+    rng = np.random.default_rng(args.seed)
+    rng.shuffle(proteins)
+
+    val_frac = 0.1  # as in geodtm_ablation.py
+    n_val_prot = max(1, int(np.ceil(len(proteins) * val_frac)))
+    val_proteins = set(proteins[:n_val_prot])
+    train_proteins = set(proteins[n_val_prot:])
+
+    train_df = full_df[full_df[protein_col].isin(train_proteins)].reset_index(drop=True)
+    val_df   = full_df[full_df[protein_col].isin(val_proteins)].reset_index(drop=True)
+
+    print(f"Protein-disjoint split:")
+    print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
+    print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
+
+    # The rest is unchanged, use these DataFrames for the datasets
+    train_ds = GeoPathoAblationDataset(train_df, args.features_dir, 
         use_fixed_embedding=args.use_fixed_embedding,
         use_dynamic_embedding=args.use_dynamic_embedding,
         use_pair=args.use_pair,
@@ -250,7 +282,7 @@ def main():
         use_pH=args.use_pH,
         use_plddt=args.use_plddt
     )
-    val_ds = GeoPathoAblationDataset(args.val_csv, args.features_dir,
+    val_ds   = GeoPathoAblationDataset(val_df, args.features_dir, 
         use_fixed_embedding=args.use_fixed_embedding,
         use_dynamic_embedding=args.use_dynamic_embedding,
         use_pair=args.use_pair,
@@ -258,6 +290,7 @@ def main():
         use_pH=args.use_pH,
         use_plddt=args.use_plddt
     )
+    
     test_ds = GeoPathoAblationDataset(args.test_csv, args.features_dir,
         use_fixed_embedding=args.use_fixed_embedding,
         use_dynamic_embedding=args.use_dynamic_embedding,
