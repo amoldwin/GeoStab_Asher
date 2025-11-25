@@ -2,27 +2,42 @@ import torch
 
 ATOM_N, ATOM_CA, ATOM_C, ATOM_O, ATOM_CB = 0, 1, 2, 3, 4
 
-
 class PretrainGeometricAttention(torch.nn.Module):
-
     def __init__(self, node_dim, n_head, pair_dim):
         super().__init__()
-
         self.node_dim = node_dim
         self.n_head = n_head
         self.head_dim = node_dim // n_head
-
-        # * to alpha
         self.query = torch.nn.Linear(node_dim, self.head_dim * n_head, bias=False)
         self.key = torch.nn.Linear(node_dim, self.head_dim * n_head, bias=False)
         self.value = torch.nn.Linear(node_dim, self.head_dim * n_head, bias=False)
         self.pair2alpha = torch.nn.Linear(pair_dim, n_head, bias=False)
-        self.conv2dalpha = torch.nn.Sequential(torch.nn.InstanceNorm2d(n_head * 2), torch.nn.Conv2d(n_head * 2, n_head, 3, 1, 1), torch.nn.LeakyReLU())
+        # original pathway
+        self.conv2dalpha = torch.nn.Sequential(
+            torch.nn.InstanceNorm2d(n_head * 2),
+            torch.nn.Conv2d(n_head * 2, n_head, 3, 1, 1),
+            torch.nn.LeakyReLU()
+        )
+        # fallback for singleton spatial case (LayerNorm + Linear)
+        self.fallback_norm = torch.nn.Sequential(
+            torch.nn.LayerNorm(n_head * 2),
+            torch.nn.Linear(n_head * 2, n_head),
+            torch.nn.LeakyReLU()
+        )
 
-        # output
-        self.out_transform = torch.nn.Sequential(torch.nn.LayerNorm(n_head * pair_dim + node_dim), torch.nn.Linear(n_head * pair_dim + node_dim, node_dim * 2), torch.nn.LayerNorm(node_dim * 2), torch.nn.LeakyReLU(), torch.nn.Linear(node_dim * 2, node_dim))
+        self.out_transform = torch.nn.Sequential(
+            torch.nn.LayerNorm(n_head * pair_dim + node_dim),
+            torch.nn.Linear(n_head * pair_dim + node_dim, node_dim * 2),
+            torch.nn.LayerNorm(node_dim * 2),
+            torch.nn.LeakyReLU(),
+            torch.nn.Linear(node_dim * 2, node_dim)
+        )
         self.layer_norm = torch.nn.LayerNorm(node_dim)
-        self.alpha2pair = torch.nn.Sequential(torch.nn.InstanceNorm2d(n_head + pair_dim), torch.nn.Conv2d(n_head + pair_dim, pair_dim, 3, 1, 1), torch.nn.LeakyReLU())
+        self.alpha2pair = torch.nn.Sequential(
+            torch.nn.InstanceNorm2d(n_head + pair_dim),
+            torch.nn.Conv2d(n_head + pair_dim, pair_dim, 3, 1, 1),
+            torch.nn.LeakyReLU()
+        )
 
     @staticmethod
     def _heads(x, n_head, n_ch):
@@ -88,34 +103,33 @@ class PretrainGeometricAttention(torch.nn.Module):
 
         return node_from_pair
 
-    def forward(self, x, z, mask):
-
-        # x = [N, L, node_dim]
-        # z = [N, L, L, pair_dim]
-        # mask = [N, L]
-
+def forward(self, x, z, mask):
         alpha_from_node = self._node2alpha(x)
         alpha_from_pair = self._pair2alpha(z)
+        # shape: [batch, L, L, n_head]
+        # concat on last axis
+        alpha_input = torch.cat((alpha_from_pair, alpha_from_node), dim=-1).permute(0, 3, 1, 2)  # [batch, channels, height, width]
+        batch, channels, height, width = alpha_input.shape
 
-        # alpha_from_node = [N, L, L, n_head]
-        # alpha_from_pair = [N, L, L, n_head]
+        if height * width > 1:
+            alpha_sum = self.conv2dalpha(alpha_input).permute(0, 2, 3, 1)
+        else:
+            # fallback for singleton spatial input (LayerNorm+Linear)
+            # input: [batch, channels, 1, 1] → [batch, channels]
+            alpha_flat = alpha_input.view(batch, channels)
+            # fallback_norm applies LayerNorm+Linear+LeakyReLU and restores output shape
+            alpha_out = self.fallback_norm(alpha_flat)  # [batch, n_head]
+            # put back spatial dims: [batch, 1, 1, n_head]
+            alpha_sum = alpha_out.view(batch, 1, 1, self.n_head)
 
-        alpha_sum = self.conv2dalpha(torch.cat((alpha_from_pair, alpha_from_node), dim=-1).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
         N, L = alpha_sum.shape[:2]
         mask_row = mask.view(N, L, 1, 1).expand_as(alpha_sum)
         mask_pair = mask_row * mask_row.permute(0, 2, 1, 3)
         alpha_sum = torch.where(mask_pair, alpha_sum, alpha_sum - 1e6)
         alpha = torch.softmax(alpha_sum, dim=2)
         alpha = torch.where(mask_row, alpha, torch.zeros_like(alpha))
-
-        # alpha = [N, L, L, n_head]
-
         node_from_node = self._node_aggregation(alpha, x)
         node_from_pair = self._pair_aggregation(alpha, z)
-
-        # node_from_node = [N, L, node_dim]
-        # node_from_pair = [N, L, n_head * pair_dim]
-
         x_out = self.out_transform(torch.cat([node_from_pair, node_from_node], dim=-1))
         x = self.layer_norm(x + x_out)
         return x, self.alpha2pair(torch.cat((z, alpha), dim=-1).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)

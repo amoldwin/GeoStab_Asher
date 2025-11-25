@@ -102,8 +102,8 @@ def main():
     mut_fastas, mut_dirs = collect_variant_fastas(sample_dirs, "mut_data")
 
     # Step 3: Batch DL models
-    #print("Batching ESM2...", flush=True)
-    #batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
+    print("Batching ESM2...", flush=True)
+    batch_run_esm2(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
     
     
     #removing because esm1v not 
@@ -111,7 +111,7 @@ def main():
     # batch_run_esm1v(wt_fastas + mut_fastas, wt_dirs + mut_dirs, batch_size=8)
 
     # Step 4: Lightweight features (fixed_embedding, coordinate, pair)
-    ##run_fixed_embedding(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
+    run_fixed_embedding(wt_fastas + mut_fastas, wt_dirs + mut_dirs)
     run_coordinate_and_pair(sample_dirs)
 
     # Step 5: Ensemble generation

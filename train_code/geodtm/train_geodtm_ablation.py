@@ -319,8 +319,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     suffix = ablation_suffix(args)
-    best_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_best_{suffix}.pt")
-    test_csv_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_test_predictions_{suffix}.csv")
+    best_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_best_{suffix}_{args.seed}.pt")
+    test_csv_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_test_predictions_{suffix}_{args.seed}.csv")
 
     # Dim of fixed_full: 7+1+1 if all present, fewer if ablated
     fixed_dim = 0
