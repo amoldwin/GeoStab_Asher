@@ -22,7 +22,10 @@ class GeoPathoAblationDataset(Dataset):
                  use_fixed_embedding=True, use_dynamic_embedding=True,
                  use_pair=True, use_atom_mask=True, use_pH=True, use_plddt=True):
         super().__init__()
-        self.df = pd.read_csv(csv_path)
+        if isinstance(csv_path, pd.DataFrame):
+            self.df = csv_path.reset_index(drop=True)
+        else:
+            self.df = pd.read_csv(csv_path)
         self.features_dir = features_dir
         self.use_fixed_embedding = use_fixed_embedding
         self.use_dynamic_embedding = use_dynamic_embedding
