@@ -1,17 +1,10 @@
 # -*- coding: utf-8 -*-
 # NOTE: This file is a lightly modified copy of the repository version.
-# Changes ensure that ablated inputs are actually removed from model computation:
-#  - Fixed features (physchem / pH / pLDDT) are now optionally injected into the
-#    encoder's initial node embedding. When ablated they are zeroed by the dataset,
-#    and the model will therefore not see them.
-#  - Proper projection layers are defined with correct input sizes.
-#  - The encoder's blocks are reused (so pretrain blocks are applied to the
-#    combined embedding) rather than calling PretrainEncoder.forward which would
-#    re-run esm2_transform on the dynamic embedding.
-#
-# Rationale: previously the model defined projection layers (input_proj / fixed_proj)
-# but never actually used them in encode(); fixed features therefore had no effect.
-# The edits below make the usage explicit and robust to batched / unbatched inputs.
+# Fixes:
+#  - Detect fixed feature vector length from dataset (avoid mismatched Linear in_features).
+#  - Construct model after datasets so optimizer includes all parameters.
+#  - Add explicit shape checks and clear error messages for easier debugging.
+#  - Keep previous ablation behavior: dataset zeroes ablated features; model injects fixed features.
 
 import os
 import math
@@ -165,6 +158,7 @@ class GeoDTmAblationModel(nn.Module):
 
         # Project concatenated [node_dim_from_esm2, fixed_dim] -> node_dim
         if fixed_dim > 0:
+            # fixed_proj consumes the fixed vector (per-residue) and outputs node_dim
             self.fixed_proj = nn.Sequential(
                 nn.Linear(fixed_dim, node_dim),
                 nn.LeakyReLU(),
@@ -208,7 +202,15 @@ class GeoDTmAblationModel(nn.Module):
             fixed_proj = torch.zeros_like(dyn_node)
         else:
             if fixed_full.dim() == 2:
-                fixed_full = fixed_full.unsqueeze(0)
+                fixed_full = fixed_full.unsqueeze(0)  # [1, L, N_fixed]
+            # Sanity check: dataset vs model bookkeeping
+            sample_fixed_dim = fixed_full.shape[-1]
+            if sample_fixed_dim != self.fixed_dim:
+                raise RuntimeError(
+                    f"fixed_full last-dim ({sample_fixed_dim}) != model.fixed_dim ({self.fixed_dim}). "
+                    "This indicates a mismatch between the dataset's fixed vector length and the model construction. "
+                    "Ensure the model was created after the datasets or that fixed feature flags are correct."
+                )
             # Project fixed features into node_dim
             if self.fixed_dim > 0:
                 fixed_proj = self.fixed_proj(fixed_full)  # [N, L, node_dim]
@@ -374,12 +376,6 @@ def main():
     best_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_best_{suffix}_{args.seed}.pt")
     test_csv_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_test_predictions_{suffix}_{args.seed}.csv")
 
-    # Dim of fixed_full: 7+1+1 if all present, fewer if ablated
-    fixed_dim = 0
-    if args.use_fixed_embedding: fixed_dim += 7
-    if args.use_pH: fixed_dim += 1
-    if args.use_plddt: fixed_dim += 1
-
     # --- Data ---
     # Load full training CSV as DataFrame
     full_df = pd.read_csv(args.train_csv)
@@ -440,7 +436,34 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
-    # --- Model ---
+    # --- Detect fixed feature size from dataset to avoid mismatches ---
+    detected_fixed_dim = None
+    for ds in (train_ds, val_ds, test_ds):
+        try:
+            wt_sample, mut_sample, _ = ds[0]
+            sample_fixed = None
+            if isinstance(wt_sample, dict):
+                sample_fixed = wt_sample.get("fixed_full", None) or wt_sample.get("fixed_embedding", None)
+            if sample_fixed is not None:
+                detected_fixed_dim = sample_fixed.shape[-1]
+                break
+        except Exception:
+            # dataset might be empty or single-sample inaccessible; skip
+            continue
+
+    if detected_fixed_dim is None:
+        # fallback to flags as best-effort (7 physchem + pH + pLDDT)
+        detected_fixed_dim = 0
+        if args.use_fixed_embedding: detected_fixed_dim += 7
+        if args.use_pH: detected_fixed_dim += 1
+        if args.use_plddt: detected_fixed_dim += 1
+        print(f"[Warning] Could not detect fixed feature length from dataset samples. Falling back to computed fixed_dim={detected_fixed_dim}.", flush=True)
+    else:
+        print(f"[Info] Detected fixed feature vector length from dataset: {detected_fixed_dim}", flush=True)
+
+    fixed_dim = detected_fixed_dim
+
+    # --- Model (create AFTER datasets so fixed_dim matches actual data) ---
     model = GeoDTmAblationModel(
         node_dim=args.node_dim,
         n_head=args.n_head,
