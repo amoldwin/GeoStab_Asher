@@ -1,3 +1,18 @@
+# -*- coding: utf-8 -*-
+# NOTE: This file is a lightly modified copy of the repository version.
+# Changes ensure that ablated inputs are actually removed from model computation:
+#  - Fixed features (physchem / pH / pLDDT) are now optionally injected into the
+#    encoder's initial node embedding. When ablated they are zeroed by the dataset,
+#    and the model will therefore not see them.
+#  - Proper projection layers are defined with correct input sizes.
+#  - The encoder's blocks are reused (so pretrain blocks are applied to the
+#    combined embedding) rather than calling PretrainEncoder.forward which would
+#    re-run esm2_transform on the dynamic embedding.
+#
+# Rationale: previously the model defined projection layers (input_proj / fixed_proj)
+# but never actually used them in encode(); fixed features therefore had no effect.
+# The edits below make the usage explicit and robust to batched / unbatched inputs.
+
 import os
 import math
 import argparse
@@ -15,7 +30,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../model_dTm_3D")))
-
 from model import PretrainEncoder, ATOM_CA
 
 ###############################################################################
@@ -55,7 +69,7 @@ class GeoDTmAblationDataset(Dataset):
         L = d_emb.shape[0]
         feature_dict["dynamic_embedding"] = d_emb if self.use_dynamic_embedding else torch.zeros_like(d_emb)
         
-        # Fixed embedding
+        # Fixed embedding (7 physchem dims)
         fixed = torch.load(os.path.join(folder, "fixed_embedding.pt")).float()
         fixed = fixed if self.use_fixed_embedding else torch.zeros_like(fixed)
         if fixed.dim() == 1:
@@ -95,7 +109,7 @@ class GeoDTmAblationDataset(Dataset):
             pad_val = plddt[-1] if L_plddt > 0 else torch.tensor(0.0, dtype=plddt.dtype)
             pad = pad_val.repeat(L - L_plddt)
             plddt = torch.cat([plddt, pad], dim=0)
-        plddt = plddt / 100.0  # Normalize
+        plddt = plddt / 100.0  # Normalize to [0,1]
         plddt_feat = plddt.unsqueeze(-1)
         feature_dict["plddt"] = plddt_feat if self.use_plddt else torch.zeros_like(plddt_feat)
 
@@ -137,6 +151,8 @@ class GeoDTmAblationDataset(Dataset):
 class GeoDTmAblationModel(nn.Module):
     def __init__(self, node_dim, n_head, pair_dim, num_layer, fixed_dim):
         super().__init__()
+        # Reuse the PretrainEncoder blocks (same architecture) but we will
+        # manually prepare the initial node embedding to include fixed features
         self.encoder = PretrainEncoder(node_dim, n_head, pair_dim, num_layer)
         self.head = nn.Sequential(
             nn.LayerNorm(node_dim),
@@ -147,15 +163,18 @@ class GeoDTmAblationModel(nn.Module):
         self.fixed_dim = fixed_dim
         self.node_dim = node_dim
 
-        # Add this line to fix error:
-        self.input_proj = nn.Linear(1280 + fixed_dim, node_dim)
-
-        # Adjust embedding of fixed features for ablation (if needed for other architectures)
-        self.fixed_proj = nn.Sequential(
-            nn.Linear(fixed_dim, node_dim),
-            nn.LeakyReLU(),
-            nn.Linear(node_dim, node_dim)
-        )
+        # Project concatenated [node_dim_from_esm2, fixed_dim] -> node_dim
+        if fixed_dim > 0:
+            self.fixed_proj = nn.Sequential(
+                nn.Linear(fixed_dim, node_dim),
+                nn.LeakyReLU(),
+                nn.Linear(node_dim, node_dim)
+            )
+            # input_proj maps (node_dim + node_dim) -> node_dim after fixed_proj
+            self.input_proj = nn.Linear(node_dim + node_dim, node_dim)
+        else:
+            # If no fixed features are used, no proj is necessary; keep identity-like projection
+            self.input_proj = nn.Identity()
 
     @staticmethod
     def _masked_mean(x: torch.Tensor, mask_1d: torch.Tensor) -> torch.Tensor:
@@ -165,18 +184,52 @@ class GeoDTmAblationModel(nn.Module):
         return x.sum(dim=1) / denom
 
     def encode(self, data):
+        # Dynamic embedding: ensure batch dim
         dyn_emb = data["dynamic_embedding"]
         if dyn_emb.dim() == 2:
-            dyn_emb = dyn_emb.unsqueeze(0)
+            dyn_emb = dyn_emb.unsqueeze(0)  # [1, L, 1280]
+        # Pair: [1, L, L, 7] or [N, L, L, 7]
         pair = data["pair"]
         if pair.dim() == 3:
             pair = pair.unsqueeze(0)
+        # Atom mask: [1, L, 14]
         atom_mask = data["atom_mask"]
         if atom_mask.dim() == 2:
             atom_mask = atom_mask.unsqueeze(0)
-        node_feat = self.encoder(dyn_emb, pair, atom_mask)
+
+        # 1) esm2 -> node_dim
+        # We will use the encoder's esm2_transform (same weights as PretrainEncoder)
+        dyn_node = self.encoder.esm2_transform(dyn_emb)  # [N, L, node_dim]
+
+        # 2) fixed features (if present)
+        fixed_full = data.get("fixed_full", None)
+        if fixed_full is None:
+            # tolerate older datasets that don't provide fixed_full
+            fixed_proj = torch.zeros_like(dyn_node)
+        else:
+            if fixed_full.dim() == 2:
+                fixed_full = fixed_full.unsqueeze(0)
+            # Project fixed features into node_dim
+            if self.fixed_dim > 0:
+                fixed_proj = self.fixed_proj(fixed_full)  # [N, L, node_dim]
+            else:
+                fixed_proj = torch.zeros_like(dyn_node)
+
+        # 3) combine dynamic node and fixed projection
+        if isinstance(self.input_proj, nn.Identity):
+            embedding = dyn_node
+        else:
+            # concat along feature dim and project
+            embedding = self.input_proj(torch.cat([dyn_node, fixed_proj], dim=-1))  # [N, L, node_dim]
+
+        # 4) pair encoding and run blocks
+        pair_enc = self.encoder.pair_encoder(pair)
+        for block in self.encoder.blocks:
+            embedding, pair_enc = block(embedding, pair_enc, atom_mask[:, :, ATOM_CA])
+
+        # embedding [N, L, node_dim]
         res_mask = atom_mask[:, :, ATOM_CA]
-        pooled = self._masked_mean(node_feat, res_mask)
+        pooled = self._masked_mean(embedding, res_mask)
         return pooled
 
     def forward(self, wt_data, mut_data):
@@ -291,6 +344,7 @@ def main():
     parser.add_argument("--out_dir", type=str, default="geodtm_models_ablation")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--job_id", type=str, default="ablation_job")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
 
     # Ablation switches
     parser.add_argument("--use_fixed_embedding", action="store_true", default=True)
@@ -305,18 +359,13 @@ def main():
     parser.add_argument("--no_pH", action="store_false", dest="use_pH")
     parser.add_argument("--use_plddt", action="store_true", default=True)
     parser.add_argument("--no_plddt", action="store_false", dest="use_plddt")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
-
-    
-  
 
     args = parser.parse_args()
-    print(f"using seed:{args.seed}", flush=True)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
+    torch.manual_seed(args.seed or 0)
+    torch.cuda.manual_seed_all(args.seed or 0)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.makedirs(args.out_dir, exist_ok=True)
