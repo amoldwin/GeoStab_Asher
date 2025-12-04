@@ -1,3 +1,12 @@
+# -*- coding: utf-8 -*-
+# Radius ablation script — fixed to make ablations effective and robust.
+# Key fixes:
+#  - Zero ablated fixed features explicitly in the dataset.
+#  - Deterministic fixed_dim = 7 + int(use_pH) + int(use_plddt).
+#  - Inject fixed features into node embedding via fixed_proj + input_proj so
+#    zeroed fixed inputs are actually removed from model computation.
+#  - Safeguards for pLDDT padding and clear shape checks.
+
 import os
 import math
 import argparse
@@ -12,7 +21,6 @@ import sys
 import random
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
-
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../model_dTm_3D")))
 from model import PretrainEncoder, ATOM_CA
@@ -66,44 +74,65 @@ class GeoDTmRadiusAblationDataset(Dataset):
         if os.path.exists(info_path):
             info = pd.read_csv(info_path, index_col=0)
             if "mut_pos" in info.columns:
-                try: mut_pos = int(info.loc["test", "mut_pos"])
-                except Exception: mut_pos = None
+                try:
+                    mut_pos = int(info.loc["test", "mut_pos"])
+                except Exception:
+                    mut_pos = None
         if mut_pos is None:
             raise ValueError(f"Could not determine mut_pos for {sample_id}")
 
-        # Loading and cropping features
+        # Loading raw features
         d_emb = torch.load(os.path.join(folder, "esm2.pt")).float()
         fixed = torch.load(os.path.join(folder, "fixed_embedding.pt")).float()
-        if fixed.dim() == 1: fixed = fixed.unsqueeze(-1)
+        if fixed.dim() == 1:
+            fixed = fixed.unsqueeze(-1)
 
         pair = torch.load(os.path.join(folder, "pair.pt")).float()
         coord_data = torch.load(os.path.join(folder, "coordinate.pt"))
         atom_mask = coord_data["pos14_mask"].all(dim=-1)
-        
+
         # pH feature
         ph_val = 7.0
         if self.use_pH and self.ph_col is not None:
             ph_val = float(row[self.ph_col])
             ph_val = max(0.0, min(11.0, ph_val))
         ph_feat = torch.full((d_emb.shape[0], 1), ph_val, dtype=torch.float32)
-        
+
         # pLDDT feature
         pkl_filename = "wt_esmf.pkl" if variant == "wt_data" else "mut_esmf.pkl"
         pkl_path = os.path.join(folder, pkl_filename)
-        with open(pkl_path, "rb") as f: pkl = pickle.load(f)
+        with open(pkl_path, "rb") as f:
+            pkl = pickle.load(f)
         plddt = torch.tensor(pkl["plddt"], dtype=torch.float32)
-        if plddt.dim() != 1: plddt = plddt.view(-1)
-        if plddt.shape[0] > d_emb.shape[0]: plddt = plddt[:d_emb.shape[0]]
-        elif plddt.shape[0] < d_emb.shape[0]: plddt = torch.cat([plddt, torch.full((d_emb.shape[0]-plddt.shape[0],), plddt[-1])], dim=0)
+        if plddt.dim() != 1:
+            plddt = plddt.view(-1)
+        # Protect against empty plddt vector
+        if plddt.numel() == 0:
+            plddt = torch.zeros((d_emb.shape[0],), dtype=torch.float32)
+        # shape alignment
+        if plddt.shape[0] > d_emb.shape[0]:
+            plddt = plddt[:d_emb.shape[0]]
+        elif plddt.shape[0] < d_emb.shape[0]:
+            pad_val = plddt[-1] if plddt.numel() > 0 else torch.tensor(0.0, dtype=plddt.dtype)
+            pad = pad_val.repeat(d_emb.shape[0] - plddt.shape[0])
+            plddt = torch.cat([plddt, pad], dim=0)
         plddt = plddt / 100.0
         plddt_feat = plddt.unsqueeze(-1)
 
-        # Merge features
+        # Respect ablation flags: zero out ablated components explicitly.
+        if not self.use_fixed_embedding:
+            fixed = torch.zeros_like(fixed)
+        if not self.use_pH:
+            ph_feat = torch.zeros_like(ph_feat)
+        if not self.use_plddt:
+            plddt_feat = torch.zeros_like(plddt_feat)
+
+        # Merge features: always same column order and width: [7 physchem] + [pH?] + [pLDDT?]
         fixed_full = torch.cat([fixed, ph_feat, plddt_feat], dim=-1)
 
         # Windowed crop each feature
         d_emb = self._extract_window(d_emb if self.use_dynamic_embedding else torch.zeros_like(d_emb), mut_pos)
-        fixed_full = self._extract_window(fixed_full if self.use_fixed_embedding or self.use_pH or self.use_plddt else torch.zeros_like(fixed_full), mut_pos)
+        fixed_full = self._extract_window(fixed_full, mut_pos)
         pair = self._extract_window(pair if self.use_pair else torch.zeros_like(pair), mut_pos)
         atom_mask = self._extract_window(atom_mask if self.use_atom_mask else torch.ones_like(atom_mask, dtype=torch.bool), mut_pos)
 
@@ -125,6 +154,7 @@ class GeoDTmRadiusAblationDataset(Dataset):
 
     def __len__(self):
         return len(self.df)
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         target = float(row["dTm"])
@@ -133,12 +163,14 @@ class GeoDTmRadiusAblationDataset(Dataset):
         return wt_data, mut_data, torch.tensor(target, dtype=torch.float32)
 
 ###############################################################################
-# Model (identical to your ablation model)
+# Model (updated to ingest fixed features)
 ###############################################################################
 
 class GeoDTmAblationModel(nn.Module):
     def __init__(self, node_dim, n_head, pair_dim, num_layer, fixed_dim):
         super().__init__()
+        # Reuse the PretrainEncoder blocks (same architecture) but we will
+        # manually prepare the initial node embedding to include fixed features
         self.encoder = PretrainEncoder(node_dim, n_head, pair_dim, num_layer)
         self.head = nn.Sequential(
             nn.LayerNorm(node_dim),
@@ -149,6 +181,20 @@ class GeoDTmAblationModel(nn.Module):
         self.fixed_dim = fixed_dim
         self.node_dim = node_dim
 
+        # Project concatenated [node_dim_from_esm2, fixed_dim] -> node_dim
+        if fixed_dim > 0:
+            # fixed_proj consumes the fixed vector (per-residue) and outputs node_dim
+            self.fixed_proj = nn.Sequential(
+                nn.Linear(fixed_dim, node_dim),
+                nn.LeakyReLU(),
+                nn.Linear(node_dim, node_dim)
+            )
+            # input_proj maps (node_dim + node_dim) -> node_dim after fixed_proj
+            self.input_proj = nn.Linear(node_dim + node_dim, node_dim)
+        else:
+            # If no fixed features are used, no proj is necessary; keep identity-like projection
+            self.input_proj = nn.Identity()
+
     @staticmethod
     def _masked_mean(x: torch.Tensor, mask_1d: torch.Tensor) -> torch.Tensor:
         mask = mask_1d.unsqueeze(-1)
@@ -157,18 +203,54 @@ class GeoDTmAblationModel(nn.Module):
         return x.sum(dim=1) / denom
 
     def encode(self, data):
+        # Dynamic embedding: ensure batch dim
         dyn_emb = data["dynamic_embedding"]
         if dyn_emb.dim() == 2:
-            dyn_emb = dyn_emb.unsqueeze(0)
+            dyn_emb = dyn_emb.unsqueeze(0)  # [1, L, 1280]
+        # Pair: [1, L, L, 7] or [N, L, L, 7]
         pair = data["pair"]
         if pair.dim() == 3:
             pair = pair.unsqueeze(0)
+        # Atom mask: [1, L, 14]
         atom_mask = data["atom_mask"]
         if atom_mask.dim() == 2:
             atom_mask = atom_mask.unsqueeze(0)
-        node_feat = self.encoder(dyn_emb, pair, atom_mask)
+
+        # 1) esm2 -> node_dim
+        dyn_node = self.encoder.esm2_transform(dyn_emb)  # [N, L, node_dim]
+
+        # 2) fixed features (if present)
+        fixed_full = data.get("fixed_embedding", None)
+        if fixed_full is None:
+            fixed_proj = torch.zeros_like(dyn_node)
+        else:
+            if fixed_full.dim() == 2:
+                fixed_full = fixed_full.unsqueeze(0)  # [1, L, N_fixed]
+            # Sanity check
+            if fixed_full.shape[-1] != self.fixed_dim:
+                raise RuntimeError(
+                    f"fixed_full last-dim ({fixed_full.shape[-1]}) != model.fixed_dim ({self.fixed_dim}). "
+                    "Construct the model with fixed_dim = 7 + int(use_pH) + int(use_plddt)."
+                )
+            if self.fixed_dim > 0:
+                fixed_proj = self.fixed_proj(fixed_full)  # [N, L, node_dim]
+            else:
+                fixed_proj = torch.zeros_like(dyn_node)
+
+        # 3) combine dynamic node and fixed projection
+        if isinstance(self.input_proj, nn.Identity):
+            embedding = dyn_node
+        else:
+            embedding = self.input_proj(torch.cat([dyn_node, fixed_proj], dim=-1))  # [N, L, node_dim]
+
+        # 4) pair encoding and run blocks
+        pair_enc = self.encoder.pair_encoder(pair)
+        for block in self.encoder.blocks:
+            embedding, pair_enc = block(embedding, pair_enc, atom_mask[:, :, ATOM_CA])
+
+        # embedding [N, L, node_dim]
         res_mask = atom_mask[:, :, ATOM_CA]
-        pooled = self._masked_mean(node_feat, res_mask)
+        pooled = self._masked_mean(embedding, res_mask)
         return pooled
 
     def forward(self, wt_data, mut_data):
@@ -179,7 +261,7 @@ class GeoDTmAblationModel(nn.Module):
         return out
 
 ###############################################################################
-# Training Utils - same as your ablation script
+# Training Utils - same as before
 ###############################################################################
 
 def soft_rank(x: torch.Tensor, regularization_strength: float = 1.0) -> torch.Tensor:
@@ -306,11 +388,6 @@ def main():
     best_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_best_{suffix}_{args.seed}.pt")
     test_csv_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_test_predictions_{suffix}_{args.seed}.csv")
 
-    fixed_dim = 0
-    if args.use_fixed_embedding: fixed_dim += 7
-    if args.use_pH: fixed_dim += 1
-    if args.use_plddt: fixed_dim += 1
-
     # --- Data ---
     full_df = pd.read_csv(args.train_csv)
     full_df['protein'] = full_df['name'].apply(lambda x: x.split('_')[1])
@@ -358,6 +435,11 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
     test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
+
+    # --- Compute fixed feature length deterministically ---
+    # fixed_full = [7 physchem] + [pH?] + [pLDDT?] always (we zero content for ablations)
+    fixed_dim = 7 + int(bool(args.use_pH)) + int(bool(args.use_plddt))
+    print(f"[Info] Using fixed_dim = {fixed_dim} (7 physchem + pH:{int(args.use_pH)} + pLDDT:{int(args.use_plddt)})", flush=True)
 
     # --- Model ---
     model = GeoDTmAblationModel(
