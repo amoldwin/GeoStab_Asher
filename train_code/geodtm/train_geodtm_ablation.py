@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 # NOTE: This file is a lightly modified copy of the repository version.
 # Fixes:
-#  - Detect fixed feature vector length from dataset (avoid mismatched Linear in_features).
+#  - Make fixed_dim deterministic and consistent with how dataset constructs fixed_full:
+#      fixed_full = [7 physchem dims] + [pH?] + [pLDDT?]
+#    (previous detection logic could pick up a different interpretation of flags
+#     and cause a shape mismatch at runtime).
 #  - Construct model after datasets so optimizer includes all parameters.
 #  - Add explicit shape checks and clear error messages for easier debugging.
 #  - Keep previous ablation behavior: dataset zeroes ablated features; model injects fixed features.
@@ -206,10 +209,13 @@ class GeoDTmAblationModel(nn.Module):
             # Sanity check: dataset vs model bookkeeping
             sample_fixed_dim = fixed_full.shape[-1]
             if sample_fixed_dim != self.fixed_dim:
+                # Instead of hard failing, give a clear diagnostic and adapt if possible.
                 raise RuntimeError(
                     f"fixed_full last-dim ({sample_fixed_dim}) != model.fixed_dim ({self.fixed_dim}). "
                     "This indicates a mismatch between the dataset's fixed vector length and the model construction. "
-                    "Ensure the model was created after the datasets or that fixed feature flags are correct."
+                    "The model must be created with a fixed_dim equal to the length of the dataset's fixed_full "
+                    "(7 physchem + optional pH + optional pLDDT). "
+                    "Recommended fix: create the model AFTER datasets and set fixed_dim = 7 + int(use_pH) + int(use_plddt)."
                 )
             # Project fixed features into node_dim
             if self.fixed_dim > 0:
@@ -436,32 +442,19 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
-    # --- Detect fixed feature size from dataset to avoid mismatches ---
-    detected_fixed_dim = None
-    for ds in (train_ds, val_ds, test_ds):
-        try:
-            wt_sample, mut_sample, _ = ds[0]
-            sample_fixed = None
-            if isinstance(wt_sample, dict):
-                sample_fixed = wt_sample.get("fixed_full", None) or wt_sample.get("fixed_embedding", None)
-            if sample_fixed is not None:
-                detected_fixed_dim = sample_fixed.shape[-1]
-                break
-        except Exception:
-            # dataset might be empty or single-sample inaccessible; skip
-            continue
+    # --- Compute fixed feature length deterministically ---
+    # The dataset always constructs fixed_full as: [7 physchem] + [pH?] + [pLDDT?]
+    # Even when use_fixed_embedding=False, the 7-d tensor is present (zeroed), so shape is constant.
+    fixed_dim = 0
+    fixed_dim += 7  # physchem fixed_embedding.pt always provides 7 dims on disk
+    if args.use_pH: fixed_dim += 1
+    if args.use_plddt: fixed_dim += 1
+    # Note: we deliberately DO NOT reduce fixed_dim when use_fixed_embedding is False,
+    # because the dataset still provides (or zeroes) the 7 physchem features and fixed_full
+    # will therefore always have 7 + pH + plddt columns. This ensures the model's projection
+    # layers match the true input shape coming from the dataset files.
 
-    if detected_fixed_dim is None:
-        # fallback to flags as best-effort (7 physchem + pH + pLDDT)
-        detected_fixed_dim = 0
-        if args.use_fixed_embedding: detected_fixed_dim += 7
-        if args.use_pH: detected_fixed_dim += 1
-        if args.use_plddt: detected_fixed_dim += 1
-        print(f"[Warning] Could not detect fixed feature length from dataset samples. Falling back to computed fixed_dim={detected_fixed_dim}.", flush=True)
-    else:
-        print(f"[Info] Detected fixed feature vector length from dataset: {detected_fixed_dim}", flush=True)
-
-    fixed_dim = detected_fixed_dim
+    print(f"[Info] Using fixed_dim = {fixed_dim} (7 physchem + pH:{int(args.use_pH)} + pLDDT:{int(args.use_plddt)})", flush=True)
 
     # --- Model (create AFTER datasets so fixed_dim matches actual data) ---
     model = GeoDTmAblationModel(
