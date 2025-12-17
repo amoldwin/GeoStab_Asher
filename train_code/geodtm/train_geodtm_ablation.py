@@ -10,6 +10,8 @@
 #  - Keep previous ablation behavior: dataset zeroes ablated features; model injects fixed features.
 #  - Add --delta_struct: replace mutant structure features with Δ(structure) = mutant − WT
 #    (pair features and optional pLDDT column), preserving masks and non-structure features.
+#  - Add SpearmanQueue to accumulate Spearman signal across steps so Spearman loss
+#    remains meaningful with batch_size=1.
 
 import os
 import math
@@ -275,6 +277,43 @@ def dtm_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.5) -> to
     loss_mse = F.mse_loss(pred, target)
     return alpha * loss_spear + (1.0 - alpha) * loss_mse
 
+class SpearmanQueue:
+    """A fixed-size FIFO queue of past (pred, target) scalars/vectors to accumulate Spearman signal."""
+    def __init__(self, capacity: int = 256, device: torch.device | None = None):
+        self.capacity = max(0, int(capacity))
+        self.device = device
+        self.preds = torch.empty(0, device=device)
+        self.targets = torch.empty(0, device=device)
+
+    def size(self) -> int:
+        return int(self.preds.numel())
+
+    def add(self, pred: torch.Tensor, target: torch.Tensor):
+        # Store detached history to avoid backprop through past steps
+        pred = pred.detach().reshape(-1)
+        target = target.detach().reshape(-1)
+        if self.device is not None:
+            pred = pred.to(self.device)
+            target = target.to(self.device)
+        self.preds = torch.cat([self.preds, pred], dim=0)
+        self.targets = torch.cat([self.targets, target], dim=0)
+        # Trim to capacity (FIFO)
+        excess = self.preds.numel() - self.capacity
+        if excess > 0:
+            self.preds = self.preds[excess:]
+            self.targets = self.targets[excess:]
+
+    def spearman_with_current(self, curr_pred: torch.Tensor, curr_target: torch.Tensor) -> torch.Tensor:
+        # Combine history (constants) + current sample (with grad)
+        curr_pred = curr_pred.reshape(-1)
+        curr_target = curr_target.reshape(-1)
+        all_pred = torch.cat([self.preds, curr_pred], dim=0)
+        all_target = torch.cat([self.targets, curr_target], dim=0)
+        if all_pred.numel() < 2:
+            # Not enough samples to form a correlation; return neutral contribution
+            return curr_pred.new_tensor(0.0)
+        return spearman_loss(all_pred, all_target)
+
 def move_batch_to_device(batch, device):
     wt_data, mut_data, target = batch
     for d in (wt_data, mut_data):
@@ -302,7 +341,6 @@ def apply_delta_struct(wt_data, mut_data, use_pair: bool, use_plddt: bool):
         if wt_data["fixed_full"].shape[-1] >= 1 and mut_data["fixed_full"].shape == wt_data["fixed_full"].shape:
             mut_ff = mut_data["fixed_full"].clone()
             wt_ff = wt_data["fixed_full"]
-            # last column is pLDDT by construction of dataset (7 physchem + [pH] + [pLDDT])
             mut_ff[..., -1] = mut_ff[..., -1] - wt_ff[..., -1]
             mut_data["fixed_full"] = mut_ff
 
@@ -315,6 +353,7 @@ def run_epoch(
     delta_struct: bool = False,
     use_pair: bool = True,
     use_plddt: bool = True,
+    spearman_queue: SpearmanQueue | None = None,
 ) -> tuple:
     is_train = optimizer is not None
     model.train(is_train)
@@ -332,14 +371,27 @@ def run_epoch(
             apply_delta_struct(wt_data, mut_data, use_pair=use_pair, use_plddt=use_plddt)
 
         pred = model(wt_data, mut_data)
-        loss = dtm_loss(pred, target, alpha=alpha_loss)
+        pred_vec = pred.reshape(-1)
+        targ_vec = target.reshape(-1)
+
+        # Accumulated Spearman if a queue is provided; otherwise per-batch Spearman.
+        if spearman_queue is not None:
+            loss_spear = spearman_queue.spearman_with_current(pred_vec, targ_vec)
+        else:
+            loss_spear = spearman_loss(pred_vec, targ_vec)
+
+        loss_mse = F.mse_loss(pred_vec, targ_vec)
+        loss = alpha_loss * loss_spear + (1.0 - alpha_loss) * loss_mse
 
         if is_train:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            # Push current sample into the queue AFTER update
+            if spearman_queue is not None:
+                spearman_queue.add(pred_vec, targ_vec)
 
-        bs = target.shape[0]
+        bs = targ_vec.shape[0]
         total_loss += loss.item() * bs
         n_samples += bs
         all_preds.append(pred.detach().cpu())
@@ -348,6 +400,7 @@ def run_epoch(
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
     mse = F.mse_loss(all_preds, all_targets).item()
+    # Simple Spearman via double argsort (for reporting)
     pred_rank = torch.argsort(torch.argsort(all_preds))
     targ_rank = torch.argsort(torch.argsort(all_targets))
     pred_rank = pred_rank.float() - pred_rank.float().mean()
@@ -383,7 +436,7 @@ def main():
     parser.add_argument("--num_layer", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--epochs_frozen", type=int, default=5)
+    parser.add_argument("--epochs_frozen", type=int, default=0)
     parser.add_argument("--epochs_finetune", type=int, default=50)
     parser.add_argument("--alpha_loss", type=float, default=0.5)
     parser.add_argument("--early_stop", type=int, default=10)
@@ -408,6 +461,9 @@ def main():
 
     # New switch: replace mutant structure inputs with Δ(structure)
     parser.add_argument("--delta_struct", action="store_true", help="Feed Δ(structure) = mutant − WT for mutant structure features (pair, pLDDT).")
+
+    # Accumulated Spearman queue size (for batch_size=1)
+    parser.add_argument("--spearman_queue", type=int, default=256, help="FIFO queue size to accumulate Spearman loss across steps.")
 
     args = parser.parse_args()
 
@@ -485,15 +541,10 @@ def main():
 
     # --- Compute fixed feature length deterministically ---
     # The dataset always constructs fixed_full as: [7 physchem] + [pH?] + [pLDDT?]
-    # Even when use_fixed_embedding=False, the 7-d tensor is present (zeroed), so shape is constant.
     fixed_dim = 0
     fixed_dim += 7  # physchem fixed_embedding.pt always provides 7 dims on disk
     if args.use_pH: fixed_dim += 1
     if args.use_plddt: fixed_dim += 1
-    # Note: we deliberately DO NOT reduce fixed_dim when use_fixed_embedding is False,
-    # because the dataset still provides (or zeroes) the 7 physchem features and fixed_full
-    # will therefore always have 7 + pH + plddt columns. This ensures the model's projection
-    # layers match the true input shape coming from the dataset files.
 
     print(f"[Info] Using fixed_dim = {fixed_dim} (7 physchem + pH:{int(args.use_pH)} + pLDDT:{int(args.use_plddt)})", flush=True)
     if args.delta_struct:
@@ -516,6 +567,9 @@ def main():
         verbose=True,
     )
 
+    # Spearman accumulation queue (training only)
+    train_queue = SpearmanQueue(capacity=args.spearman_queue, device=device)
+
     print("Stage 1: Freezing encoder for rapid head optimization (GeoDTm ablation).", flush=True)
     for p in model.encoder.parameters():
         p.requires_grad = False
@@ -526,11 +580,13 @@ def main():
     for epoch in range(1, args.epochs_frozen + 1):
         train_loss, train_mse, train_rho = run_epoch(
             model, train_loader, optimizer, device, args.alpha_loss,
-            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt
+            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt,
+            spearman_queue=train_queue
         )
         val_loss, val_mse, val_rho = run_epoch(
             model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss,
-            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt
+            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt,
+            spearman_queue=None
         )
         scheduler.step(val_loss)
         print(
@@ -552,15 +608,20 @@ def main():
     for p in model.encoder.parameters():
         p.requires_grad = True
 
+    # Optionally reset or keep queue; here we keep it so correlation builds up.
+    # train_queue = SpearmanQueue(capacity=args.spearman_queue, device=device)
+
     early_counter = 0
     for epoch in range(1, args.epochs_finetune + 1):
         train_loss, train_mse, train_rho = run_epoch(
             model, train_loader, optimizer, device, args.alpha_loss,
-            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt
+            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt,
+            spearman_queue=train_queue
         )
         val_loss, val_mse, val_rho = run_epoch(
             model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss,
-            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt
+            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt,
+            spearman_queue=None
         )
         scheduler.step(val_loss)
         print(
