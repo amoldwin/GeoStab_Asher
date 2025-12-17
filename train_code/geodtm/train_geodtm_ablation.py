@@ -8,6 +8,8 @@
 #  - Construct model after datasets so optimizer includes all parameters.
 #  - Add explicit shape checks and clear error messages for easier debugging.
 #  - Keep previous ablation behavior: dataset zeroes ablated features; model injects fixed features.
+#  - Add --delta_struct: replace mutant structure features with Δ(structure) = mutant − WT
+#    (pair features and optional pLDDT column), preserving masks and non-structure features.
 
 import os
 import math
@@ -282,32 +284,67 @@ def move_batch_to_device(batch, device):
     target = target.to(device)
     return wt_data, mut_data, target
 
+def apply_delta_struct(wt_data, mut_data, use_pair: bool, use_plddt: bool):
+    """
+    Replace mutant structure features with Δ(structure) = mutant − WT.
+    - pair: mut_pair = mut_pair - wt_pair (if enabled)
+    - fixed_full: last column is pLDDT when enabled -> mutate last column to ΔpLDDT
+      Physchem and pH columns remain unchanged.
+    Atom masks are preserved to remain valid attention masks.
+    """
+    # Δ pair features
+    if use_pair and ("pair" in wt_data) and ("pair" in mut_data):
+        if wt_data["pair"].shape == mut_data["pair"].shape:
+            mut_data["pair"] = mut_data["pair"] - wt_data["pair"]
+
+    # Δ pLDDT if present (always last column in fixed_full when use_plddt=True)
+    if use_plddt and ("fixed_full" in wt_data) and ("fixed_full" in mut_data):
+        if wt_data["fixed_full"].shape[-1] >= 1 and mut_data["fixed_full"].shape == wt_data["fixed_full"].shape:
+            mut_ff = mut_data["fixed_full"].clone()
+            wt_ff = wt_data["fixed_full"]
+            # last column is pLDDT by construction of dataset (7 physchem + [pH] + [pLDDT])
+            mut_ff[..., -1] = mut_ff[..., -1] - wt_ff[..., -1]
+            mut_data["fixed_full"] = mut_ff
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer = None,
     device: torch.device = torch.device("cuda"),
     alpha_loss: float = 0.5,
+    delta_struct: bool = False,
+    use_pair: bool = True,
+    use_plddt: bool = True,
 ) -> tuple:
     is_train = optimizer is not None
     model.train(is_train)
+
     all_preds = []
     all_targets = []
     total_loss = 0.0
     n_samples = 0
+
     for batch in loader:
         wt_data, mut_data, target = move_batch_to_device(batch, device)
+
+        # Apply Δ(structure) to mutant channel if requested
+        if delta_struct:
+            apply_delta_struct(wt_data, mut_data, use_pair=use_pair, use_plddt=use_plddt)
+
         pred = model(wt_data, mut_data)
         loss = dtm_loss(pred, target, alpha=alpha_loss)
+
         if is_train:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
         bs = target.shape[0]
         total_loss += loss.item() * bs
         n_samples += bs
         all_preds.append(pred.detach().cpu())
         all_targets.append(target.detach().cpu())
+
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
     mse = F.mse_loss(all_preds, all_targets).item()
@@ -332,6 +369,7 @@ def ablation_suffix(args):
     if not args.use_atom_mask: ablated.append("no_atommask")
     if not args.use_pH: ablated.append("no_pH")
     if not args.use_plddt: ablated.append("no_plddt")
+    if args.delta_struct: ablated.append("delta_struct")
     return "_".join(ablated) if ablated else "all_inputs"
 
 def main():
@@ -367,6 +405,9 @@ def main():
     parser.add_argument("--no_pH", action="store_false", dest="use_pH")
     parser.add_argument("--use_plddt", action="store_true", default=True)
     parser.add_argument("--no_plddt", action="store_false", dest="use_plddt")
+
+    # New switch: replace mutant structure inputs with Δ(structure)
+    parser.add_argument("--delta_struct", action="store_true", help="Feed Δ(structure) = mutant − WT for mutant structure features (pair, pLDDT).")
 
     args = parser.parse_args()
 
@@ -455,6 +496,8 @@ def main():
     # layers match the true input shape coming from the dataset files.
 
     print(f"[Info] Using fixed_dim = {fixed_dim} (7 physchem + pH:{int(args.use_pH)} + pLDDT:{int(args.use_plddt)})", flush=True)
+    if args.delta_struct:
+        print("[Info] delta_struct enabled: mutant 'pair' replaced with Δpair, mutant pLDDT replaced with ΔpLDDT.", flush=True)
 
     # --- Model (create AFTER datasets so fixed_dim matches actual data) ---
     model = GeoDTmAblationModel(
@@ -482,10 +525,12 @@ def main():
 
     for epoch in range(1, args.epochs_frozen + 1):
         train_loss, train_mse, train_rho = run_epoch(
-            model, train_loader, optimizer, device, args.alpha_loss
+            model, train_loader, optimizer, device, args.alpha_loss,
+            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt
         )
         val_loss, val_mse, val_rho = run_epoch(
-            model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss
+            model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss,
+            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt
         )
         scheduler.step(val_loss)
         print(
@@ -510,10 +555,12 @@ def main():
     early_counter = 0
     for epoch in range(1, args.epochs_finetune + 1):
         train_loss, train_mse, train_rho = run_epoch(
-            model, train_loader, optimizer, device, args.alpha_loss
+            model, train_loader, optimizer, device, args.alpha_loss,
+            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt
         )
         val_loss, val_mse, val_rho = run_epoch(
-            model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss
+            model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss,
+            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt
         )
         scheduler.step(val_loss)
         print(
@@ -543,6 +590,8 @@ def main():
     with torch.no_grad():
         for i, batch in enumerate(test_loader):
             wt_data, mut_data, target = move_batch_to_device(batch, device)
+            if args.delta_struct:
+                apply_delta_struct(wt_data, mut_data, use_pair=args.use_pair, use_plddt=args.use_plddt)
             pred = model(wt_data, mut_data)
             sample_name = test_ds.df.iloc[i]["name"]
             test_names.append(sample_name)

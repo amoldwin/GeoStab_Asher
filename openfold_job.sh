@@ -28,8 +28,8 @@ ml cuda/11
 ##python generate_esmfold_mutant_structures.py --data_parent /projects/ashehu/amoldwin/GeoStab/data/dTm/S4346/
 ##python generate_esmfold_wt_structures.py --data_parent /projects/ashehu/amoldwin/GeoStab/data/dTm/S4346/
 
-python generate_esmfold_wt_structures.py --data_parent /projects/ashehu/amoldwin/GeoStab/data/patho/patho_FASTA/ ##--start_from_longest
-python generate_esmfold_mutant_structures.py --data_parent /projects/ashehu/amoldwin/GeoStab/data/patho/patho_FASTA/ ##--start_from_longest
+##python generate_esmfold_wt_structures.py --data_parent /projects/ashehu/amoldwin/GeoStab/data/patho/patho_FASTA/ ##--start_from_longest
+##python generate_esmfold_mutant_structures.py --data_parent /projects/ashehu/amoldwin/GeoStab/data/patho/patho_FASTA/ ##--start_from_longest
 
 
 ##python -m run_feature_scripts --use_esmfold_wt
@@ -37,3 +37,5 @@ python generate_esmfold_mutant_structures.py --data_parent /projects/ashehu/amol
 ##python generate_esmfold_mutant_structures.py --data_parent /projects/ashehu/amoldwin/GeoStab/data/patho/patho_FASTA/
 ##python generate_esmfold_wt_structures.py --data_parent /projects/ashehu/amoldwin/GeoStab/data/patho/patho_FASTA/
 ##python -m train_code.geodtm.train_geodtm_no_plddt
+
+python compute_multiple_structures_esmfold.py --data_parent /projects/ashehu/amoldwin/GeoStab/data/dTm/S4346 --mode mut --num_replicates 5 --mc_dropout

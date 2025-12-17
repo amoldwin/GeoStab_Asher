@@ -17,6 +17,10 @@ from model import PretrainEncoder, ATOM_CA
 
 PATHO_CLASS_MAP = {'Rare': 0, 'Common': 0, 'Pathogenic': 1, 'Likely-pathogenic': 1}
 
+###############################################################################
+# Dataset
+###############################################################################
+
 class GeoPathoAblationDataset(Dataset):
     def __init__(self, csv_path, features_dir,
                  use_fixed_embedding=True, use_dynamic_embedding=True,
@@ -39,37 +43,65 @@ class GeoPathoAblationDataset(Dataset):
     def _load_feature_dict(self, row, variant: str):
         sample_id = str(row["prot_variant"])
         folder = os.path.join(self.features_dir, sample_id, variant)
-        L = torch.load(os.path.join(folder, "esm2.pt")).shape[0]
+        # Load ESM2 embedding to infer length L
         d_emb = torch.load(os.path.join(folder, "esm2.pt")).float()
+        L = d_emb.shape[0]
+
+        # Dynamic embedding (may be zeroed for ablation)
         d_emb = d_emb if self.use_dynamic_embedding else torch.zeros_like(d_emb)
+
+        # Fixed 7-d physchem
         fixed = torch.load(os.path.join(folder, "fixed_embedding.pt")).float()
+        if fixed.dim() == 1:
+            fixed = fixed.unsqueeze(-1)
         fixed = fixed if self.use_fixed_embedding else torch.zeros_like(fixed)
-        if fixed.dim() == 1: fixed = fixed.unsqueeze(-1)
+
+        # Pair
         pair = torch.load(os.path.join(folder, "pair.pt")).float()
         pair = pair if self.use_pair else torch.zeros_like(pair)
+
+        # Coordinates / atom mask
         coord_data = torch.load(os.path.join(folder, "coordinate.pt"))
         atom_mask = coord_data["pos14_mask"].all(dim=-1)
         atom_mask = atom_mask if self.use_atom_mask else torch.ones_like(atom_mask, dtype=torch.bool)
+
+        # pH
         ph_val = 7.0
         if self.use_pH and self.ph_col is not None:
-            ph_val = float(row[self.ph_col])
+            try:
+                ph_val = float(row[self.ph_col])
+            except Exception:
+                ph_val = 7.0
             ph_val = max(0.0, min(11.0, ph_val))
-        if  self.ph_col is None:
-            # print("no pH col", flush=True)
-            ph_val = 7.0
         ph_feat = torch.full((L, 1), ph_val, dtype=torch.float32)
+        ph_feat = ph_feat if self.use_pH else torch.zeros_like(ph_feat)
+
+        # pLDDT from esmf pickle
         pkl_filename = "wt_esmf.pkl" if variant == "wt_data" else "mut_esmf.pkl"
         pkl_path = os.path.join(folder, pkl_filename)
         with open(pkl_path, "rb") as f:
             pkl = pickle.load(f)
-        plddt = torch.tensor(pkl["plddt"], dtype=torch.float32)
-        if plddt.dim() != 1: plddt = plddt.view(-1)
-        L_plddt = plddt.shape[0]
-        if L_plddt > L:   plddt = plddt[:L]
-        elif L_plddt < L: plddt = torch.cat([plddt, torch.full((L-L_plddt,), plddt[-1])], dim=0)
+        plddt = torch.tensor(pkl.get("plddt", []), dtype=torch.float32)
+        if plddt.dim() != 1:
+            plddt = plddt.view(-1)
+        # align lengths
+        if plddt.numel() == 0:
+            plddt = torch.zeros((L,), dtype=torch.float32)
+        else:
+            if plddt.shape[0] > L:
+                plddt = plddt[:L]
+            elif plddt.shape[0] < L:
+                pad_val = plddt[-1] if plddt.numel() > 0 else torch.tensor(0.0, dtype=plddt.dtype)
+                pad = pad_val.repeat(L - plddt.shape[0])
+                plddt = torch.cat([plddt, pad], dim=0)
         plddt = plddt / 100.0
         plddt_feat = plddt.unsqueeze(-1)
+        plddt_feat = plddt_feat if self.use_plddt else torch.zeros_like(plddt_feat)
+
+        # Merge fixed: keep columns stable in order [7 physchem] + [pH] + [pLDDT]
         fixed_full = torch.cat([fixed, ph_feat, plddt_feat], dim=-1)
+
+        # mut_pos mask (optional)
         info_path = os.path.join(self.features_dir, sample_id, "mut_info.csv")
         mut_pos_mask = torch.zeros(L, dtype=torch.float32)
         if os.path.exists(info_path):
@@ -82,6 +114,7 @@ class GeoPathoAblationDataset(Dataset):
                         mut_pos_mask[mut_pos] = 1.0
                 except Exception:
                     pass
+
         feature_dict = dict(
             dynamic_embedding=d_emb,
             fixed_embedding=fixed_full,
@@ -93,17 +126,23 @@ class GeoPathoAblationDataset(Dataset):
 
     def __len__(self):
         return len(self.df)
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         wt_data = self._load_feature_dict(row, "wt_data")
         mut_data = self._load_feature_dict(row, "mut_data")
-        label_str = row["class"]
+        label_str = row.get("class", "")
         target = PATHO_CLASS_MAP.get(label_str, 0)
         return wt_data, mut_data, torch.tensor(target, dtype=torch.float32)
+
+###############################################################################
+# Model
+###############################################################################
 
 class GeoPathoAblationModel(nn.Module):
     def __init__(self, node_dim, n_head, pair_dim, num_layer, fixed_dim):
         super().__init__()
+        # Reuse PretrainEncoder components for consistency with other scripts
         self.encoder = PretrainEncoder(node_dim, n_head, pair_dim, num_layer)
         self.head = nn.Sequential(
             nn.LayerNorm(node_dim),
@@ -114,6 +153,18 @@ class GeoPathoAblationModel(nn.Module):
         self.fixed_dim = fixed_dim
         self.node_dim = node_dim
 
+        # Project fixed vector -> node_dim. Use bias=False so zero inputs map to zero outputs.
+        if fixed_dim > 0:
+            self.fixed_proj = nn.Sequential(
+                nn.Linear(fixed_dim, node_dim, bias=False),
+                nn.LeakyReLU(),
+                nn.Linear(node_dim, node_dim, bias=False),
+            )
+            # input_proj maps concatenated [dyn_node, fixed_proj] -> node_dim
+            self.input_proj = nn.Linear(node_dim + node_dim, node_dim)
+        else:
+            self.input_proj = nn.Identity()
+
     @staticmethod
     def _masked_mean(x: torch.Tensor, mask_1d: torch.Tensor) -> torch.Tensor:
         mask = mask_1d.unsqueeze(-1)
@@ -122,12 +173,57 @@ class GeoPathoAblationModel(nn.Module):
         return x.sum(dim=1) / denom
 
     def encode(self, data):
-        dyn_emb = data["dynamic_embedding"].unsqueeze(0) if data["dynamic_embedding"].dim() == 2 else data["dynamic_embedding"]
-        pair = data["pair"].unsqueeze(0) if data["pair"].dim() == 3 else data["pair"]
-        atom_mask = data["atom_mask"].unsqueeze(0) if data["atom_mask"].dim() == 2 else data["atom_mask"]
-        node_feat = self.encoder(dyn_emb, pair, atom_mask)
+        # dynamic embedding: allow unbatched input
+        dyn_emb = data["dynamic_embedding"]
+        if dyn_emb.dim() == 2:
+            dyn_emb = dyn_emb.unsqueeze(0)  # [1, L, 1280]
+
+        # pair
+        pair = data["pair"]
+        if pair.dim() == 3:
+            pair = pair.unsqueeze(0)
+
+        # atom_mask
+        atom_mask = data["atom_mask"]
+        if atom_mask.dim() == 2:
+            atom_mask = atom_mask.unsqueeze(0)
+
+        # 1) esm2 -> node_dim
+        dyn_node = self.encoder.esm2_transform(dyn_emb)  # [N, L, node_dim]
+
+        # 2) fixed features: dataset provides fixed_embedding = [L, fixed_dim] even when ablated
+        fixed = data.get("fixed_embedding", None)
+        if fixed is None:
+            fixed_proj = torch.zeros_like(dyn_node)
+        else:
+            if fixed.dim() == 2:
+                fixed = fixed.unsqueeze(0)  # [1, L, fixed_dim]
+            sample_fixed_dim = fixed.shape[-1]
+            if sample_fixed_dim != self.fixed_dim:
+                raise RuntimeError(
+                    f"fixed_embedding last-dim ({sample_fixed_dim}) != model.fixed_dim ({self.fixed_dim}). "
+                    "Model should be constructed with fixed_dim = 7 + 1 + 1 (physchem + pH + pLDDT) "
+                    "and the dataset keeps these columns (zeroed for ablation)."
+                )
+            if self.fixed_dim > 0:
+                fixed_proj = self.fixed_proj(fixed)  # [N, L, node_dim]
+            else:
+                fixed_proj = torch.zeros_like(dyn_node)
+
+        # 3) combine and project to initial embedding
+        if isinstance(self.input_proj, nn.Identity):
+            embedding = dyn_node
+        else:
+            embedding = self.input_proj(torch.cat([dyn_node, fixed_proj], dim=-1))  # [N, L, node_dim]
+
+        # 4) pair encoding and apply blocks
+        pair_enc = self.encoder.pair_encoder(pair)
+        for block in self.encoder.blocks:
+            embedding, pair_enc = block(embedding, pair_enc, atom_mask[:, :, ATOM_CA])
+
+        # pooling
         res_mask = atom_mask[:, :, ATOM_CA]
-        pooled = self._masked_mean(node_feat, res_mask)
+        pooled = self._masked_mean(embedding, res_mask)
         return pooled
 
     def forward(self, wt_data, mut_data):
@@ -136,6 +232,10 @@ class GeoPathoAblationModel(nn.Module):
         delta = z_mut - z_wt
         out = self.head(delta).squeeze(-1)
         return out
+
+###############################################################################
+# Training helpers (unchanged)
+###############################################################################
 
 def move_batch_to_device(batch, device):
     wt_data, mut_data, target = batch
@@ -173,11 +273,9 @@ def run_epoch(
         all_targets.append(target.detach().cpu())
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
-    # Compute classification metrics
     probs = torch.sigmoid(all_preds)
     preds = (probs > 0.5).float()
     acc = (preds == all_targets).float().mean().item()
-    # AUC requires at least two classes
     try:
         from sklearn.metrics import roc_auc_score
         auc = roc_auc_score(all_targets.numpy(), probs.numpy())
@@ -194,6 +292,10 @@ def ablation_suffix(args):
     if not args.use_pH: ablated.append("no_pH")
     if not args.use_plddt: ablated.append("no_plddt")
     return "_".join(ablated) if ablated else "all_inputs"
+
+###############################################################################
+# Main
+###############################################################################
 
 def main():
     parser = argparse.ArgumentParser()
@@ -240,32 +342,24 @@ def main():
     suffix = ablation_suffix(args)
     best_path = os.path.join(args.out_dir, f"{args.job_id}_geopatho_best_{suffix}_{args.seed}.pt")
     test_csv_path = os.path.join(args.out_dir, f"{args.job_id}_geopatho_test_predictions_{suffix}_{args.seed}.csv")
-    # fixed_full: 7+1+1 if all present, fewer if ablated
-    fixed_dim = 0
-    if args.use_fixed_embedding: fixed_dim += 7
-    if args.use_pH: fixed_dim += 1
-    if args.use_plddt: fixed_dim += 1
+
+    # fixed_dim: keep deterministic layout -> 7 physchem + pH + pLDDT = 9
+    fixed_dim = 7 + 1 + 1
+    print(f"[Info] Using fixed_dim = {fixed_dim} (7 physchem + pH + pLDDT). The dataset keeps columns zeroed for ablation.", flush=True)
 
     # Datasets
-    # Load and concatenate train + val CSVs
     train_df  = pd.read_csv(args.train_csv)
     val_df    = pd.read_csv(args.val_csv)
     full_df   = pd.concat([train_df, val_df], axis=0, ignore_index=True)
 
-    # Identify the per-protein (or per-variant) column
-    protein_col = "prot_acc_version"  # or "protein" or "prot_variant" as appropriate
-   
-
-    # Get unique proteins/variants
+    protein_col = "prot_acc_version"  # adapt if needed
     proteins = full_df[protein_col].unique()
     rng = np.random.default_rng(args.seed)
     rng.shuffle(proteins)
-
-    val_frac = 0.1  # as in geodtm_ablation.py
+    val_frac = 0.1
     n_val_prot = max(1, int(np.ceil(len(proteins) * val_frac)))
     val_proteins = set(proteins[:n_val_prot])
     train_proteins = set(proteins[n_val_prot:])
-
     train_df = full_df[full_df[protein_col].isin(train_proteins)].reset_index(drop=True)
     val_df   = full_df[full_df[protein_col].isin(val_proteins)].reset_index(drop=True)
 
@@ -273,8 +367,7 @@ def main():
     print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
     print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
 
-    # The rest is unchanged, use these DataFrames for the datasets
-    train_ds = GeoPathoAblationDataset(train_df, args.features_dir, 
+    train_ds = GeoPathoAblationDataset(train_df, args.features_dir,
         use_fixed_embedding=args.use_fixed_embedding,
         use_dynamic_embedding=args.use_dynamic_embedding,
         use_pair=args.use_pair,
@@ -282,7 +375,7 @@ def main():
         use_pH=args.use_pH,
         use_plddt=args.use_plddt
     )
-    val_ds   = GeoPathoAblationDataset(val_df, args.features_dir, 
+    val_ds = GeoPathoAblationDataset(val_df, args.features_dir,
         use_fixed_embedding=args.use_fixed_embedding,
         use_dynamic_embedding=args.use_dynamic_embedding,
         use_pair=args.use_pair,
@@ -290,7 +383,6 @@ def main():
         use_pH=args.use_pH,
         use_plddt=args.use_plddt
     )
-    
     test_ds = GeoPathoAblationDataset(args.test_csv, args.features_dir,
         use_fixed_embedding=args.use_fixed_embedding,
         use_dynamic_embedding=args.use_dynamic_embedding,
@@ -299,10 +391,12 @@ def main():
         use_pH=args.use_pH,
         use_plddt=args.use_plddt
     )
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
 
+    # Build model AFTER datasets to ensure consistent behavior and optimizer parameters
     model = GeoPathoAblationModel(
         node_dim=args.node_dim,
         n_head=args.n_head,
@@ -313,6 +407,7 @@ def main():
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=3, verbose=True)
+
     print("Stage 1: Freezing encoder for rapid head optimization (GeoPatho ablation).", flush=True)
     for p in model.encoder.parameters():
         p.requires_grad = False
@@ -367,6 +462,7 @@ def main():
         f"Test | Loss {test_loss:.4f} | Acc {test_acc:.2f} | AUC {test_auc:.3f}",
         flush=True,
     )
+
     # Save test predictions to CSV
     model.eval()
     test_names, test_preds, test_targets = [], [], []
