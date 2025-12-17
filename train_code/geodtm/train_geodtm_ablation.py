@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 # NOTE: This file is a lightly modified copy of the repository version.
-# Fixes:
-#  - Make fixed_dim deterministic and consistent with how dataset constructs fixed_full:
-#      fixed_full = [7 physchem dims] + [pH?] + [pLDDT?]
-#    (previous detection logic could pick up a different interpretation of flags
-#     and cause a shape mismatch at runtime).
-#  - Construct model after datasets so optimizer includes all parameters.
-#  - Add explicit shape checks and clear error messages for easier debugging.
-#  - Keep previous ablation behavior: dataset zeroes ablated features; model injects fixed features.
-#  - Add --delta_struct: replace mutant structure features with Δ(structure) = mutant − WT
-#    (pair features and optional pLDDT column), preserving masks and non-structure features.
-#  - Add SpearmanQueue to accumulate Spearman signal across steps so Spearman loss
-#    remains meaningful with batch_size=1.
+# Changes in this revision:
+#  - Redefine --delta_struct to compute latent-space structural residuals instead of
+#    subtracting raw geometry/pLDDT at the input level.
+#    Specifically:
+#      * Always feed absolute structural features (pair, atom_mask, pLDDT) to the encoder.
+#      * Compute a structural-only latent embedding z_struct via the encoder with
+#        zeroed sequence node inputs and pLDDT-gated atom masks.
+#      * Fuse the original residual z_delta_orig = z_mut - z_wt with the structural residual
+#        z_delta_struct = z_struct_mut - z_struct_wt using a learned gate:
+#            g = sigmoid(W_g z_delta_orig)
+#            z_final = z_delta_orig + g * z_delta_struct
+#  - Keep SpearmanQueue accumulation for batch_size=1.
+#  - Do NOT modify inputs when --delta_struct is enabled (no raw Δpair/ΔpLDDT).
 
 import os
 import math
@@ -163,6 +164,14 @@ class GeoDTmAblationModel(nn.Module):
         self.fixed_dim = fixed_dim
         self.node_dim = node_dim
 
+        # Gated fusion for latent structural residuals
+        self.use_delta_struct = False
+        self.struct_gate = nn.Sequential(
+            nn.LayerNorm(node_dim),
+            nn.Linear(node_dim, node_dim),
+            nn.Sigmoid()
+        )
+
         # Project concatenated [node_dim_from_esm2, fixed_dim] -> node_dim
         if fixed_dim > 0:
             # fixed_proj consumes the fixed vector (per-residue) and outputs node_dim
@@ -184,6 +193,24 @@ class GeoDTmAblationModel(nn.Module):
         denom = mask.sum(dim=1).clamp(min=1.0)
         return x.sum(dim=1) / denom
 
+    def _plddt_gate_atom_mask(self, atom_mask: torch.Tensor, fixed_full: torch.Tensor | None) -> torch.Tensor:
+        """
+        Combine atom_mask with a pLDDT >= 0.7 gate (if pLDDT is available).
+        Returns a boolean [N, L, 14] mask.
+        """
+        if atom_mask.dim() == 2:
+            atom_mask = atom_mask.unsqueeze(0)
+        atom_mask_bool = atom_mask.bool()
+        if fixed_full is None:
+            return atom_mask_bool
+        if fixed_full.dim() == 2:
+            fixed_full = fixed_full.unsqueeze(0)
+        # pLDDT is always last column in fixed_full as constructed by the dataset
+        plddt = fixed_full[..., -1]  # [N, L]
+        plddt_gate = (plddt >= 0.7).bool().unsqueeze(-1).repeat(1, 1, atom_mask_bool.shape[-1])
+        gated = torch.stack((atom_mask_bool, plddt_gate), dim=0).all(dim=0)
+        return gated
+
     def encode(self, data):
         # Dynamic embedding: ensure batch dim
         dyn_emb = data["dynamic_embedding"]
@@ -199,13 +226,11 @@ class GeoDTmAblationModel(nn.Module):
             atom_mask = atom_mask.unsqueeze(0)
 
         # 1) esm2 -> node_dim
-        # We will use the encoder's esm2_transform (same weights as PretrainEncoder)
         dyn_node = self.encoder.esm2_transform(dyn_emb)  # [N, L, node_dim]
 
         # 2) fixed features (if present)
         fixed_full = data.get("fixed_full", None)
         if fixed_full is None:
-            # tolerate older datasets that don't provide fixed_full
             fixed_proj = torch.zeros_like(dyn_node)
         else:
             if fixed_full.dim() == 2:
@@ -213,13 +238,9 @@ class GeoDTmAblationModel(nn.Module):
             # Sanity check: dataset vs model bookkeeping
             sample_fixed_dim = fixed_full.shape[-1]
             if sample_fixed_dim != self.fixed_dim:
-                # Instead of hard failing, give a clear diagnostic and adapt if possible.
                 raise RuntimeError(
                     f"fixed_full last-dim ({sample_fixed_dim}) != model.fixed_dim ({self.fixed_dim}). "
-                    "This indicates a mismatch between the dataset's fixed vector length and the model construction. "
-                    "The model must be created with a fixed_dim equal to the length of the dataset's fixed_full "
-                    "(7 physchem + optional pH + optional pLDDT). "
-                    "Recommended fix: create the model AFTER datasets and set fixed_dim = 7 + int(use_pH) + int(use_plddt)."
+                    "The model must be created with fixed_dim = 7 + int(use_pH) + int(use_plddt)."
                 )
             # Project fixed features into node_dim
             if self.fixed_dim > 0:
@@ -244,10 +265,57 @@ class GeoDTmAblationModel(nn.Module):
         pooled = self._masked_mean(embedding, res_mask)
         return pooled
 
+    def encode_structural(self, data):
+        """
+        Structural-only latent encoding:
+        - Zero sequence node inputs (ESM2 path).
+        - Use absolute pair features.
+        - Apply pLDDT gating to atom masks (>= 0.7 threshold).
+        """
+        dyn_emb = data["dynamic_embedding"]
+        if dyn_emb.dim() == 2:
+            dyn_emb = dyn_emb.unsqueeze(0)  # [1, L, 1280]
+        # zero node inputs via esm2_transform
+        zero_dyn = torch.zeros_like(dyn_emb)
+        node_in = self.encoder.esm2_transform(zero_dyn)  # [N, L, node_dim] zeros
+
+        pair = data["pair"]
+        if pair.dim() == 3:
+            pair = pair.unsqueeze(0)
+
+        atom_mask = data["atom_mask"]
+        if atom_mask.dim() == 2:
+            atom_mask = atom_mask.unsqueeze(0)
+
+        fixed_full = data.get("fixed_full", None)
+        gated_mask = self._plddt_gate_atom_mask(atom_mask, fixed_full)
+
+        pair_enc = self.encoder.pair_encoder(pair)
+        embedding = node_in
+        for block in self.encoder.blocks:
+            embedding, pair_enc = block(embedding, pair_enc, gated_mask[:, :, ATOM_CA])
+
+        res_mask = gated_mask[:, :, ATOM_CA]
+        pooled = self._masked_mean(embedding, res_mask)
+        return pooled
+
     def forward(self, wt_data, mut_data):
+        # Original residual (sequence+fixed+pair encoded)
         z_wt = self.encode(wt_data)
         z_mut = self.encode(mut_data)
-        delta = z_mut - z_wt
+        z_delta_orig = z_mut - z_wt
+
+        if self.use_delta_struct:
+            # Latent structural residual (absolute inputs, pLDDT gating, zero sequence nodes)
+            z_wt_struct = self.encode_structural(wt_data)
+            z_mut_struct = self.encode_structural(mut_data)
+            z_delta_struct = z_mut_struct - z_wt_struct
+
+            gate = self.struct_gate(z_delta_orig)
+            delta = z_delta_orig + gate * z_delta_struct
+        else:
+            delta = z_delta_orig
+
         out = self.head(delta).squeeze(-1)
         return out
 
@@ -323,33 +391,13 @@ def move_batch_to_device(batch, device):
     target = target.to(device)
     return wt_data, mut_data, target
 
-def apply_delta_struct(wt_data, mut_data, use_pair: bool, use_plddt: bool):
-    """
-    Replace mutant structure features with Δ(structure) = mutant − WT.
-    - pair: mut_pair = mut_pair - wt_pair (if enabled)
-    - fixed_full: last column is pLDDT when enabled -> mutate last column to ΔpLDDT
-      Physchem and pH columns remain unchanged.
-    Atom masks are preserved to remain valid attention masks.
-    """
-    # Δ pair features
-    if use_pair and ("pair" in wt_data) and ("pair" in mut_data):
-        if wt_data["pair"].shape == mut_data["pair"].shape:
-            mut_data["pair"] = mut_data["pair"] - wt_data["pair"]
-
-    # Δ pLDDT if present (always last column in fixed_full when use_plddt=True)
-    if use_plddt and ("fixed_full" in wt_data) and ("fixed_full" in mut_data):
-        if wt_data["fixed_full"].shape[-1] >= 1 and mut_data["fixed_full"].shape == wt_data["fixed_full"].shape:
-            mut_ff = mut_data["fixed_full"].clone()
-            wt_ff = wt_data["fixed_full"]
-            mut_ff[..., -1] = mut_ff[..., -1] - wt_ff[..., -1]
-            mut_data["fixed_full"] = mut_ff
-
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer = None,
     device: torch.device = torch.device("cuda"),
     alpha_loss: float = 0.5,
+    # legacy args retained for CLI compatibility; no raw input deltas applied anymore
     delta_struct: bool = False,
     use_pair: bool = True,
     use_plddt: bool = True,
@@ -366,9 +414,8 @@ def run_epoch(
     for batch in loader:
         wt_data, mut_data, target = move_batch_to_device(batch, device)
 
-        # Apply Δ(structure) to mutant channel if requested
-        if delta_struct:
-            apply_delta_struct(wt_data, mut_data, use_pair=use_pair, use_plddt=use_plddt)
+        # No raw Δpair/ΔpLDDT application here; we always feed absolute inputs.
+        # Latent residual fusion is handled inside the model when model.use_delta_struct=True.
 
         pred = model(wt_data, mut_data)
         pred_vec = pred.reshape(-1)
@@ -422,7 +469,7 @@ def ablation_suffix(args):
     if not args.use_atom_mask: ablated.append("no_atommask")
     if not args.use_pH: ablated.append("no_pH")
     if not args.use_plddt: ablated.append("no_plddt")
-    if args.delta_struct: ablated.append("delta_struct")
+    if args.delta_struct: ablated.append("latent_delta_struct")
     return "_".join(ablated) if ablated else "all_inputs"
 
 def main():
@@ -459,8 +506,12 @@ def main():
     parser.add_argument("--use_plddt", action="store_true", default=True)
     parser.add_argument("--no_plddt", action="store_false", dest="use_plddt")
 
-    # New switch: replace mutant structure inputs with Δ(structure)
-    parser.add_argument("--delta_struct", action="store_true", help="Feed Δ(structure) = mutant − WT for mutant structure features (pair, pLDDT).")
+    # New behavior: latent-space structural residual fusion
+    parser.add_argument(
+        "--delta_struct",
+        action="store_true",
+        help="Fuse latent structural residuals (mutant−WT in encoder latent space), gated by z_delta_orig."
+    )
 
     # Accumulated Spearman queue size (for batch_size=1)
     parser.add_argument("--spearman_queue", type=int, default=256, help="FIFO queue size to accumulate Spearman loss across steps.")
@@ -480,16 +531,12 @@ def main():
     test_csv_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_test_predictions_{suffix}_{args.seed}.csv")
 
     # --- Data ---
-    # Load full training CSV as DataFrame
     full_df = pd.read_csv(args.train_csv)
-
-    # Tag each entry with its protein name using name format
     full_df['protein'] = full_df['name'].apply(lambda x: x.split('_')[1])
-    protein_col = "protein"  # <-- change if needed
+    protein_col = "protein"
 
     assert protein_col in full_df.columns, f"{protein_col} not in train CSV"
 
-    # Get unique proteins and split them into train / val sets
     val_frac = 0.1
     proteins = full_df[protein_col].unique()
     rng = np.random.default_rng(args.seed)
@@ -548,7 +595,7 @@ def main():
 
     print(f"[Info] Using fixed_dim = {fixed_dim} (7 physchem + pH:{int(args.use_pH)} + pLDDT:{int(args.use_plddt)})", flush=True)
     if args.delta_struct:
-        print("[Info] delta_struct enabled: mutant 'pair' replaced with Δpair, mutant pLDDT replaced with ΔpLDDT.", flush=True)
+        print("[Info] --delta_struct enabled: using latent structural residuals with gated fusion (no raw Δpair/ΔpLDDT).", flush=True)
 
     # --- Model (create AFTER datasets so fixed_dim matches actual data) ---
     model = GeoDTmAblationModel(
@@ -558,6 +605,7 @@ def main():
         num_layer=args.num_layer,
         fixed_dim=fixed_dim
     ).to(device)
+    model.use_delta_struct = bool(args.delta_struct)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -609,7 +657,6 @@ def main():
         p.requires_grad = True
 
     # Optionally reset or keep queue; here we keep it so correlation builds up.
-    # train_queue = SpearmanQueue(capacity=args.spearman_queue, device=device)
 
     early_counter = 0
     for epoch in range(1, args.epochs_finetune + 1):
@@ -651,8 +698,6 @@ def main():
     with torch.no_grad():
         for i, batch in enumerate(test_loader):
             wt_data, mut_data, target = move_batch_to_device(batch, device)
-            if args.delta_struct:
-                apply_delta_struct(wt_data, mut_data, use_pair=args.use_pair, use_plddt=args.use_plddt)
             pred = model(wt_data, mut_data)
             sample_name = test_ds.df.iloc[i]["name"]
             test_names.append(sample_name)
