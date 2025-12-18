@@ -11,7 +11,8 @@
 #        z_delta_struct = z_struct_mut - z_struct_wt using a learned gate:
 #            g = sigmoid(W_g z_delta_orig)
 #            z_final = z_delta_orig + g * z_delta_struct
-#  - Keep SpearmanQueue accumulation for batch_size=1.
+#  - SpearmanQueue accumulation is OPTIONAL: set --spearman_queue 0 to disable and
+#    use regular per-batch Spearman+MSE during training (as before).
 #  - Do NOT modify inputs when --delta_struct is enabled (no raw Δpair/ΔpLDDT).
 
 import os
@@ -514,7 +515,12 @@ def main():
     )
 
     # Accumulated Spearman queue size (for batch_size=1)
-    parser.add_argument("--spearman_queue", type=int, default=256, help="FIFO queue size to accumulate Spearman loss across steps.")
+    parser.add_argument(
+        "--spearman_queue",
+        type=int,
+        default=256,
+        help="FIFO queue size to accumulate Spearman loss across steps. Set 0 to disable (use per-batch Spearman+MSE)."
+    )
 
     args = parser.parse_args()
 
@@ -615,8 +621,13 @@ def main():
         verbose=True,
     )
 
-    # Spearman accumulation queue (training only)
-    train_queue = SpearmanQueue(capacity=args.spearman_queue, device=device)
+    # Spearman accumulation queue (training only) — optional
+    if args.spearman_queue is not None and args.spearman_queue > 0:
+        train_queue = SpearmanQueue(capacity=args.spearman_queue, device=device)
+        print(f"[Info] SpearmanQueue enabled (capacity={args.spearman_queue}).", flush=True)
+    else:
+        train_queue = None
+        print("[Info] SpearmanQueue disabled: using per-batch Spearman+MSE during training.", flush=True)
 
     print("Stage 1: Freezing encoder for rapid head optimization (GeoDTm ablation).", flush=True)
     for p in model.encoder.parameters():
@@ -656,7 +667,8 @@ def main():
     for p in model.encoder.parameters():
         p.requires_grad = True
 
-    # Optionally reset or keep queue; here we keep it so correlation builds up.
+    # Keep or disable queue per args
+    # train_queue remains None if disabled above
 
     early_counter = 0
     for epoch in range(1, args.epochs_finetune + 1):
