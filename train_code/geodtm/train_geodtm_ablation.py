@@ -1,19 +1,13 @@
 # -*- coding: utf-8 -*-
 # NOTE: This file is a lightly modified copy of the repository version.
-# Changes in this revision:
-#  - Redefine --delta_struct to compute latent-space structural residuals instead of
-#    subtracting raw geometry/pLDDT at the input level.
-#    Specifically:
-#      * Always feed absolute structural features (pair, atom_mask, pLDDT) to the encoder.
-#      * Compute a structural-only latent embedding z_struct via the encoder with
-#        zeroed sequence node inputs and pLDDT-gated atom masks.
-#      * Fuse the original residual z_delta_orig = z_mut - z_wt with the structural residual
-#        z_delta_struct = z_struct_mut - z_struct_wt using a learned gate:
-#            g = sigmoid(W_g z_delta_orig)
-#            z_final = z_delta_orig + g * z_delta_struct
-#  - SpearmanQueue accumulation is OPTIONAL: set --spearman_queue 0 to disable and
-#    use regular per-batch Spearman+MSE during training (as before).
-#  - Do NOT modify inputs when --delta_struct is enabled (no raw Δpair/ΔpLDDT).
+# Fixes:
+#  - Make fixed_dim deterministic and consistent with how dataset constructs fixed_full:
+#      fixed_full = [7 physchem dims] + [pH?] + [pLDDT?]
+#    (previous detection logic could pick up a different interpretation of flags
+#     and cause a shape mismatch at runtime).
+#  - Construct model after datasets so optimizer includes all parameters.
+#  - Add explicit shape checks and clear error messages for easier debugging.
+#  - Keep previous ablation behavior: dataset zeroes ablated features; model injects fixed features.
 
 import os
 import math
@@ -165,14 +159,6 @@ class GeoDTmAblationModel(nn.Module):
         self.fixed_dim = fixed_dim
         self.node_dim = node_dim
 
-        # Gated fusion for latent structural residuals
-        self.use_delta_struct = False
-        self.struct_gate = nn.Sequential(
-            nn.LayerNorm(node_dim),
-            nn.Linear(node_dim, node_dim),
-            nn.Sigmoid()
-        )
-
         # Project concatenated [node_dim_from_esm2, fixed_dim] -> node_dim
         if fixed_dim > 0:
             # fixed_proj consumes the fixed vector (per-residue) and outputs node_dim
@@ -194,24 +180,6 @@ class GeoDTmAblationModel(nn.Module):
         denom = mask.sum(dim=1).clamp(min=1.0)
         return x.sum(dim=1) / denom
 
-    def _plddt_gate_atom_mask(self, atom_mask: torch.Tensor, fixed_full: torch.Tensor | None) -> torch.Tensor:
-        """
-        Combine atom_mask with a pLDDT >= 0.7 gate (if pLDDT is available).
-        Returns a boolean [N, L, 14] mask.
-        """
-        if atom_mask.dim() == 2:
-            atom_mask = atom_mask.unsqueeze(0)
-        atom_mask_bool = atom_mask.bool()
-        if fixed_full is None:
-            return atom_mask_bool
-        if fixed_full.dim() == 2:
-            fixed_full = fixed_full.unsqueeze(0)
-        # pLDDT is always last column in fixed_full as constructed by the dataset
-        plddt = fixed_full[..., -1]  # [N, L]
-        plddt_gate = (plddt >= 0.7).bool().unsqueeze(-1).repeat(1, 1, atom_mask_bool.shape[-1])
-        gated = torch.stack((atom_mask_bool, plddt_gate), dim=0).all(dim=0)
-        return gated
-
     def encode(self, data):
         # Dynamic embedding: ensure batch dim
         dyn_emb = data["dynamic_embedding"]
@@ -227,11 +195,13 @@ class GeoDTmAblationModel(nn.Module):
             atom_mask = atom_mask.unsqueeze(0)
 
         # 1) esm2 -> node_dim
+        # We will use the encoder's esm2_transform (same weights as PretrainEncoder)
         dyn_node = self.encoder.esm2_transform(dyn_emb)  # [N, L, node_dim]
 
         # 2) fixed features (if present)
         fixed_full = data.get("fixed_full", None)
         if fixed_full is None:
+            # tolerate older datasets that don't provide fixed_full
             fixed_proj = torch.zeros_like(dyn_node)
         else:
             if fixed_full.dim() == 2:
@@ -239,9 +209,13 @@ class GeoDTmAblationModel(nn.Module):
             # Sanity check: dataset vs model bookkeeping
             sample_fixed_dim = fixed_full.shape[-1]
             if sample_fixed_dim != self.fixed_dim:
+                # Instead of hard failing, give a clear diagnostic and adapt if possible.
                 raise RuntimeError(
                     f"fixed_full last-dim ({sample_fixed_dim}) != model.fixed_dim ({self.fixed_dim}). "
-                    "The model must be created with fixed_dim = 7 + int(use_pH) + int(use_plddt)."
+                    "This indicates a mismatch between the dataset's fixed vector length and the model construction. "
+                    "The model must be created with a fixed_dim equal to the length of the dataset's fixed_full "
+                    "(7 physchem + optional pH + optional pLDDT). "
+                    "Recommended fix: create the model AFTER datasets and set fixed_dim = 7 + int(use_pH) + int(use_plddt)."
                 )
             # Project fixed features into node_dim
             if self.fixed_dim > 0:
@@ -266,57 +240,10 @@ class GeoDTmAblationModel(nn.Module):
         pooled = self._masked_mean(embedding, res_mask)
         return pooled
 
-    def encode_structural(self, data):
-        """
-        Structural-only latent encoding:
-        - Zero sequence node inputs (ESM2 path).
-        - Use absolute pair features.
-        - Apply pLDDT gating to atom masks (>= 0.7 threshold).
-        """
-        dyn_emb = data["dynamic_embedding"]
-        if dyn_emb.dim() == 2:
-            dyn_emb = dyn_emb.unsqueeze(0)  # [1, L, 1280]
-        # zero node inputs via esm2_transform
-        zero_dyn = torch.zeros_like(dyn_emb)
-        node_in = self.encoder.esm2_transform(zero_dyn)  # [N, L, node_dim] zeros
-
-        pair = data["pair"]
-        if pair.dim() == 3:
-            pair = pair.unsqueeze(0)
-
-        atom_mask = data["atom_mask"]
-        if atom_mask.dim() == 2:
-            atom_mask = atom_mask.unsqueeze(0)
-
-        fixed_full = data.get("fixed_full", None)
-        gated_mask = self._plddt_gate_atom_mask(atom_mask, fixed_full)
-
-        pair_enc = self.encoder.pair_encoder(pair)
-        embedding = node_in
-        for block in self.encoder.blocks:
-            embedding, pair_enc = block(embedding, pair_enc, gated_mask[:, :, ATOM_CA])
-
-        res_mask = gated_mask[:, :, ATOM_CA]
-        pooled = self._masked_mean(embedding, res_mask)
-        return pooled
-
     def forward(self, wt_data, mut_data):
-        # Original residual (sequence+fixed+pair encoded)
         z_wt = self.encode(wt_data)
         z_mut = self.encode(mut_data)
-        z_delta_orig = z_mut - z_wt
-
-        if self.use_delta_struct:
-            # Latent structural residual (absolute inputs, pLDDT gating, zero sequence nodes)
-            z_wt_struct = self.encode_structural(wt_data)
-            z_mut_struct = self.encode_structural(mut_data)
-            z_delta_struct = z_mut_struct - z_wt_struct
-
-            gate = self.struct_gate(z_delta_orig)
-            delta = z_delta_orig + gate * z_delta_struct
-        else:
-            delta = z_delta_orig
-
+        delta = z_mut - z_wt
         out = self.head(delta).squeeze(-1)
         return out
 
@@ -346,43 +273,6 @@ def dtm_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.5) -> to
     loss_mse = F.mse_loss(pred, target)
     return alpha * loss_spear + (1.0 - alpha) * loss_mse
 
-class SpearmanQueue:
-    """A fixed-size FIFO queue of past (pred, target) scalars/vectors to accumulate Spearman signal."""
-    def __init__(self, capacity: int = 256, device: torch.device | None = None):
-        self.capacity = max(0, int(capacity))
-        self.device = device
-        self.preds = torch.empty(0, device=device)
-        self.targets = torch.empty(0, device=device)
-
-    def size(self) -> int:
-        return int(self.preds.numel())
-
-    def add(self, pred: torch.Tensor, target: torch.Tensor):
-        # Store detached history to avoid backprop through past steps
-        pred = pred.detach().reshape(-1)
-        target = target.detach().reshape(-1)
-        if self.device is not None:
-            pred = pred.to(self.device)
-            target = target.to(self.device)
-        self.preds = torch.cat([self.preds, pred], dim=0)
-        self.targets = torch.cat([self.targets, target], dim=0)
-        # Trim to capacity (FIFO)
-        excess = self.preds.numel() - self.capacity
-        if excess > 0:
-            self.preds = self.preds[excess:]
-            self.targets = self.targets[excess:]
-
-    def spearman_with_current(self, curr_pred: torch.Tensor, curr_target: torch.Tensor) -> torch.Tensor:
-        # Combine history (constants) + current sample (with grad)
-        curr_pred = curr_pred.reshape(-1)
-        curr_target = curr_target.reshape(-1)
-        all_pred = torch.cat([self.preds, curr_pred], dim=0)
-        all_target = torch.cat([self.targets, curr_target], dim=0)
-        if all_pred.numel() < 2:
-            # Not enough samples to form a correlation; return neutral contribution
-            return curr_pred.new_tensor(0.0)
-        return spearman_loss(all_pred, all_target)
-
 def move_batch_to_device(batch, device):
     wt_data, mut_data, target = batch
     for d in (wt_data, mut_data):
@@ -398,57 +288,29 @@ def run_epoch(
     optimizer: torch.optim.Optimizer = None,
     device: torch.device = torch.device("cuda"),
     alpha_loss: float = 0.5,
-    # legacy args retained for CLI compatibility; no raw input deltas applied anymore
-    delta_struct: bool = False,
-    use_pair: bool = True,
-    use_plddt: bool = True,
-    spearman_queue: SpearmanQueue | None = None,
 ) -> tuple:
     is_train = optimizer is not None
     model.train(is_train)
-
     all_preds = []
     all_targets = []
     total_loss = 0.0
     n_samples = 0
-
     for batch in loader:
         wt_data, mut_data, target = move_batch_to_device(batch, device)
-
-        # No raw Δpair/ΔpLDDT application here; we always feed absolute inputs.
-        # Latent residual fusion is handled inside the model when model.use_delta_struct=True.
-
         pred = model(wt_data, mut_data)
-        pred_vec = pred.reshape(-1)
-        targ_vec = target.reshape(-1)
-
-        # Accumulated Spearman if a queue is provided; otherwise per-batch Spearman.
-        if spearman_queue is not None:
-            loss_spear = spearman_queue.spearman_with_current(pred_vec, targ_vec)
-        else:
-            loss_spear = spearman_loss(pred_vec, targ_vec)
-
-        loss_mse = F.mse_loss(pred_vec, targ_vec)
-        loss = alpha_loss * loss_spear + (1.0 - alpha_loss) * loss_mse
-
+        loss = dtm_loss(pred, target, alpha=alpha_loss)
         if is_train:
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            # Push current sample into the queue AFTER update
-            if spearman_queue is not None:
-                spearman_queue.add(pred_vec, targ_vec)
-
-        bs = targ_vec.shape[0]
+        bs = target.shape[0]
         total_loss += loss.item() * bs
         n_samples += bs
         all_preds.append(pred.detach().cpu())
         all_targets.append(target.detach().cpu())
-
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
     mse = F.mse_loss(all_preds, all_targets).item()
-    # Simple Spearman via double argsort (for reporting)
     pred_rank = torch.argsort(torch.argsort(all_preds))
     targ_rank = torch.argsort(torch.argsort(all_targets))
     pred_rank = pred_rank.float() - pred_rank.float().mean()
@@ -470,7 +332,6 @@ def ablation_suffix(args):
     if not args.use_atom_mask: ablated.append("no_atommask")
     if not args.use_pH: ablated.append("no_pH")
     if not args.use_plddt: ablated.append("no_plddt")
-    if args.delta_struct: ablated.append("latent_delta_struct")
     return "_".join(ablated) if ablated else "all_inputs"
 
 def main():
@@ -484,7 +345,7 @@ def main():
     parser.add_argument("--num_layer", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--epochs_frozen", type=int, default=0)
+    parser.add_argument("--epochs_frozen", type=int, default=5)
     parser.add_argument("--epochs_finetune", type=int, default=50)
     parser.add_argument("--alpha_loss", type=float, default=0.5)
     parser.add_argument("--early_stop", type=int, default=10)
@@ -507,21 +368,6 @@ def main():
     parser.add_argument("--use_plddt", action="store_true", default=True)
     parser.add_argument("--no_plddt", action="store_false", dest="use_plddt")
 
-    # New behavior: latent-space structural residual fusion
-    parser.add_argument(
-        "--delta_struct",
-        action="store_true",
-        help="Fuse latent structural residuals (mutant−WT in encoder latent space), gated by z_delta_orig."
-    )
-
-    # Accumulated Spearman queue size (for batch_size=1)
-    parser.add_argument(
-        "--spearman_queue",
-        type=int,
-        default=256,
-        help="FIFO queue size to accumulate Spearman loss across steps. Set 0 to disable (use per-batch Spearman+MSE)."
-    )
-
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -537,12 +383,16 @@ def main():
     test_csv_path = os.path.join(args.out_dir, f"{args.job_id}_geodtm_test_predictions_{suffix}_{args.seed}.csv")
 
     # --- Data ---
+    # Load full training CSV as DataFrame
     full_df = pd.read_csv(args.train_csv)
+
+    # Tag each entry with its protein name using name format
     full_df['protein'] = full_df['name'].apply(lambda x: x.split('_')[1])
-    protein_col = "protein"
+    protein_col = "protein"  # <-- change if needed
 
     assert protein_col in full_df.columns, f"{protein_col} not in train CSV"
 
+    # Get unique proteins and split them into train / val sets
     val_frac = 0.1
     proteins = full_df[protein_col].unique()
     rng = np.random.default_rng(args.seed)
@@ -594,14 +444,17 @@ def main():
 
     # --- Compute fixed feature length deterministically ---
     # The dataset always constructs fixed_full as: [7 physchem] + [pH?] + [pLDDT?]
+    # Even when use_fixed_embedding=False, the 7-d tensor is present (zeroed), so shape is constant.
     fixed_dim = 0
     fixed_dim += 7  # physchem fixed_embedding.pt always provides 7 dims on disk
     if args.use_pH: fixed_dim += 1
     if args.use_plddt: fixed_dim += 1
+    # Note: we deliberately DO NOT reduce fixed_dim when use_fixed_embedding is False,
+    # because the dataset still provides (or zeroes) the 7 physchem features and fixed_full
+    # will therefore always have 7 + pH + plddt columns. This ensures the model's projection
+    # layers match the true input shape coming from the dataset files.
 
     print(f"[Info] Using fixed_dim = {fixed_dim} (7 physchem + pH:{int(args.use_pH)} + pLDDT:{int(args.use_plddt)})", flush=True)
-    if args.delta_struct:
-        print("[Info] --delta_struct enabled: using latent structural residuals with gated fusion (no raw Δpair/ΔpLDDT).", flush=True)
 
     # --- Model (create AFTER datasets so fixed_dim matches actual data) ---
     model = GeoDTmAblationModel(
@@ -611,7 +464,6 @@ def main():
         num_layer=args.num_layer,
         fixed_dim=fixed_dim
     ).to(device)
-    model.use_delta_struct = bool(args.delta_struct)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -620,14 +472,6 @@ def main():
         patience=5,
         verbose=True,
     )
-
-    # Spearman accumulation queue (training only) — optional
-    if args.spearman_queue is not None and args.spearman_queue > 0:
-        train_queue = SpearmanQueue(capacity=args.spearman_queue, device=device)
-        print(f"[Info] SpearmanQueue enabled (capacity={args.spearman_queue}).", flush=True)
-    else:
-        train_queue = None
-        print("[Info] SpearmanQueue disabled: using per-batch Spearman+MSE during training.", flush=True)
 
     print("Stage 1: Freezing encoder for rapid head optimization (GeoDTm ablation).", flush=True)
     for p in model.encoder.parameters():
@@ -638,14 +482,10 @@ def main():
 
     for epoch in range(1, args.epochs_frozen + 1):
         train_loss, train_mse, train_rho = run_epoch(
-            model, train_loader, optimizer, device, args.alpha_loss,
-            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt,
-            spearman_queue=train_queue
+            model, train_loader, optimizer, device, args.alpha_loss
         )
         val_loss, val_mse, val_rho = run_epoch(
-            model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss,
-            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt,
-            spearman_queue=None
+            model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss
         )
         scheduler.step(val_loss)
         print(
@@ -667,20 +507,13 @@ def main():
     for p in model.encoder.parameters():
         p.requires_grad = True
 
-    # Keep or disable queue per args
-    # train_queue remains None if disabled above
-
     early_counter = 0
     for epoch in range(1, args.epochs_finetune + 1):
         train_loss, train_mse, train_rho = run_epoch(
-            model, train_loader, optimizer, device, args.alpha_loss,
-            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt,
-            spearman_queue=train_queue
+            model, train_loader, optimizer, device, args.alpha_loss
         )
         val_loss, val_mse, val_rho = run_epoch(
-            model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss,
-            delta_struct=args.delta_struct, use_pair=args.use_pair, use_plddt=args.use_plddt,
-            spearman_queue=None
+            model, val_loader, optimizer=None, device=device, alpha_loss=args.alpha_loss
         )
         scheduler.step(val_loss)
         print(
