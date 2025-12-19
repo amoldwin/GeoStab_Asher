@@ -8,6 +8,7 @@
 #  - Construct model after datasets so optimizer includes all parameters.
 #  - Add explicit shape checks and clear error messages for easier debugging.
 #  - Keep previous ablation behavior: dataset zeroes ablated features; model injects fixed features.
+#  - Add --dup_wt_struct option to use wildtype structure for both WT and MUT branches (structure-only duplication).
 
 import os
 import math
@@ -35,8 +36,17 @@ from model import PretrainEncoder, ATOM_CA
 class GeoDTmAblationDataset(Dataset):
     def __init__(
         self, csv_or_df, features_dir, use_fixed_embedding=True, use_dynamic_embedding=True,
-        use_pair=True, use_atom_mask=True, use_pH=True, use_plddt=True
+        use_pair=True, use_atom_mask=True, use_pH=True, use_plddt=True,
+        dup_wt_struct: bool = False,
     ):
+        """
+        dup_wt_struct:
+          If True, the mutant branch will reuse the wildtype STRUCTURAL features:
+            - pair.pt
+            - coordinate.pt (pos14_mask -> atom_mask)
+            - wt_esmf.pkl (pLDDT)
+          Dynamic and fixed embeddings for the mutant branch still come from mut_data.
+        """
         super().__init__()
         if isinstance(csv_or_df, pd.DataFrame):
             self.df = csv_or_df.reset_index(drop=True)
@@ -49,6 +59,7 @@ class GeoDTmAblationDataset(Dataset):
         self.use_atom_mask = use_atom_mask
         self.use_pH = use_pH
         self.use_plddt = use_plddt
+        self.dup_wt_struct = dup_wt_struct
         # Infer pH column
         ph_candidates = [c for c in self.df.columns if c.lower() == "ph"]
         self.ph_col = ph_candidates[0] if ph_candidates else None
@@ -56,32 +67,37 @@ class GeoDTmAblationDataset(Dataset):
     def _load_feature_dict(self, row, variant: str):
         sample_id = str(row["name"])
         folder = os.path.join(self.features_dir, sample_id, variant)
-        L = None
 
+        # When duplicating WT structure, structural files for mut_data come from wt_data
+        struct_folder = folder
+        if self.dup_wt_struct and variant == "mut_data":
+            struct_folder = os.path.join(self.features_dir, sample_id, "wt_data")
+
+        L = None
         feature_dict = {}
 
-        # Dynamic embedding (ESM2)
+        # Dynamic embedding (ESM2) — always from the variant's own folder
         d_emb = torch.load(os.path.join(folder, "esm2.pt")).float()
         L = d_emb.shape[0]
         feature_dict["dynamic_embedding"] = d_emb if self.use_dynamic_embedding else torch.zeros_like(d_emb)
         
-        # Fixed embedding (7 physchem dims)
+        # Fixed embedding (7 physchem dims) — always from the variant's own folder
         fixed = torch.load(os.path.join(folder, "fixed_embedding.pt")).float()
         fixed = fixed if self.use_fixed_embedding else torch.zeros_like(fixed)
         if fixed.dim() == 1:
             fixed = fixed.unsqueeze(-1)
         feature_dict["fixed_embedding"] = fixed
 
-        # Pair features
-        pair = torch.load(os.path.join(folder, "pair.pt")).float()
+        # Pair features — from struct_folder (WT if dup_wt_struct & variant==mut_data)
+        pair = torch.load(os.path.join(struct_folder, "pair.pt")).float()
         feature_dict["pair"] = pair if self.use_pair else torch.zeros_like(pair)
 
-        # Atom mask from coordinate.pt
-        coord_data = torch.load(os.path.join(folder, "coordinate.pt"))
+        # Atom mask from coordinate.pt — from struct_folder (WT if dup_wt_struct & variant==mut_data)
+        coord_data = torch.load(os.path.join(struct_folder, "coordinate.pt"))
         atom_mask = coord_data["pos14_mask"].all(dim=-1)  # already bool
         feature_dict["atom_mask"] = atom_mask if self.use_atom_mask else torch.ones_like(atom_mask, dtype=torch.bool)
 
-        # pH feature (expand to [L, 1])
+        # pH feature (expand to [L, 1]) — scalar from CSV
         ph_val = 7.0
         if self.use_pH and self.ph_col is not None:
             ph_val = float(row[self.ph_col])
@@ -89,15 +105,23 @@ class GeoDTmAblationDataset(Dataset):
         ph_feat = torch.full((L, 1), ph_val, dtype=torch.float32)
         feature_dict["pH"] = ph_feat if self.use_pH else torch.zeros_like(ph_feat)
 
-        # pLDDT feature (expand to [L, 1])
-        pkl_filename = "wt_esmf.pkl" if variant == "wt_data" else "mut_esmf.pkl"
-        pkl_path = os.path.join(folder, pkl_filename)
+        # pLDDT feature — from struct_folder (WT if dup_wt_struct & variant==mut_data)
+        # Choose filename based on which folder we are reading from
+        if struct_folder == folder:
+            # Normal behavior
+            pkl_filename = "wt_esmf.pkl" if variant == "wt_data" else "mut_esmf.pkl"
+        else:
+            # When reusing WT structure for mutant, always use wt_esmf.pkl from struct_folder
+            pkl_filename = "wt_esmf.pkl"
+
+        pkl_path = os.path.join(struct_folder, pkl_filename)
         with open(pkl_path, "rb") as f:
             pkl = pickle.load(f)
         plddt = torch.tensor(pkl["plddt"], dtype=torch.float32)
         if plddt.dim() != 1:
             plddt = plddt.view(-1)
-        # shape alignment
+
+        # Align pLDDT to sequence length L from dynamic embedding
         L_plddt = plddt.shape[0]
         if L_plddt > L:
             plddt = plddt[:L]
@@ -332,6 +356,7 @@ def ablation_suffix(args):
     if not args.use_atom_mask: ablated.append("no_atommask")
     if not args.use_pH: ablated.append("no_pH")
     if not args.use_plddt: ablated.append("no_plddt")
+    if args.dup_wt_struct: ablated.append("dupWTstruct")
     return "_".join(ablated) if ablated else "all_inputs"
 
 def main():
@@ -367,6 +392,14 @@ def main():
     parser.add_argument("--no_pH", action="store_false", dest="use_pH")
     parser.add_argument("--use_plddt", action="store_true", default=True)
     parser.add_argument("--no_plddt", action="store_false", dest="use_plddt")
+
+    # New: duplicate WT structure for mutant branch
+    parser.add_argument(
+        "--dup_wt_struct",
+        action="store_true",
+        default=False,
+        help="Use wildtype structure (pair, atom_mask, pLDDT) for BOTH WT and MUT branches; MUT keeps its sequence embeddings."
+    )
 
     args = parser.parse_args()
 
@@ -409,38 +442,25 @@ def main():
     print(f"  Train proteins: {len(train_proteins)}, samples: {len(train_df)}")
     print(f"  Val proteins:   {len(val_proteins)}, samples: {len(val_df)}", flush=True)
 
-    # Build datasets from DataFrames
-    train_ds = GeoDTmAblationDataset(
-        train_df, args.features_dir,
+    # Build datasets from DataFrames (pass dup_wt_struct)
+    common_ds_kwargs = dict(
+        features_dir=args.features_dir,
         use_fixed_embedding=args.use_fixed_embedding,
         use_dynamic_embedding=args.use_dynamic_embedding,
         use_pair=args.use_pair,
         use_atom_mask=args.use_atom_mask,
         use_pH=args.use_pH,
-        use_plddt=args.use_plddt
-    )
-    val_ds = GeoDTmAblationDataset(
-        val_df, args.features_dir,
-        use_fixed_embedding=args.use_fixed_embedding,
-        use_dynamic_embedding=args.use_dynamic_embedding,
-        use_pair=args.use_pair,
-        use_atom_mask=args.use_atom_mask,
-        use_pH=args.use_pH,
-        use_plddt=args.use_plddt
-    )
-    test_ds = GeoDTmAblationDataset(
-        args.test_csv, args.features_dir,
-        use_fixed_embedding=args.use_fixed_embedding,
-        use_dynamic_embedding=args.use_dynamic_embedding,
-        use_pair=args.use_pair,
-        use_atom_mask=args.use_atom_mask,
-        use_pH=args.use_pH,
-        use_plddt=args.use_plddt
+        use_plddt=args.use_plddt,
+        dup_wt_struct=args.dup_wt_struct,
     )
 
+    train_ds = GeoDTmAblationDataset(train_df, **common_ds_kwargs)
+    val_ds   = GeoDTmAblationDataset(val_df,   **common_ds_kwargs)
+    test_ds  = GeoDTmAblationDataset(args.test_csv, **common_ds_kwargs)
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False)
+    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False)
 
     # --- Compute fixed feature length deterministically ---
     # The dataset always constructs fixed_full as: [7 physchem] + [pH?] + [pLDDT?]
@@ -449,10 +469,6 @@ def main():
     fixed_dim += 7  # physchem fixed_embedding.pt always provides 7 dims on disk
     if args.use_pH: fixed_dim += 1
     if args.use_plddt: fixed_dim += 1
-    # Note: we deliberately DO NOT reduce fixed_dim when use_fixed_embedding is False,
-    # because the dataset still provides (or zeroes) the 7 physchem features and fixed_full
-    # will therefore always have 7 + pH + plddt columns. This ensures the model's projection
-    # layers match the true input shape coming from the dataset files.
 
     print(f"[Info] Using fixed_dim = {fixed_dim} (7 physchem + pH:{int(args.use_pH)} + pLDDT:{int(args.use_plddt)})", flush=True)
 
